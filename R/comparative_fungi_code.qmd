@@ -1,0 +1,2318 @@
+---
+title: "Comparative Fungi - Chapter 3"
+format:
+  html:
+    code-fold: true
+  gfm: default
+---
+
+This document is organised in two parts:
+
+1. **Data processing and statistical analyses**: QC, taxonomic placement and all
+   tests (PERMANOVA, betadisper, Wilcoxon / Kruskal-Wallis, Mantel).
+2. **Figures**: every chunk that builds or saves a figure. Figure chunk labels
+   start with `fig_`. These chunks reuse objects created in part 1, so the
+   document must be run top to bottom.
+
+# Setup
+
+## Packages and global options
+
+```{r}
+#| label: run_setup
+#| message: false
+
+library(tidyverse)
+library(patchwork)
+library(paletteer)
+library(ggrepel)
+library(ggpubr)
+library(ggtext)
+library(ggpmisc)
+library(scales)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(vegan)
+library(ape)
+library(phangorn)
+
+`%notin%` <- Negate(`%in%`)
+
+set.seed(42)
+N_PERM <- 10000
+
+knitr::opts_chunk$set(results='hold', message=FALSE, cache = TRUE,
+                      warning=FALSE, fig.show="hold",
+                      out.width="100%", fig.align="center",
+                      fig.width=15, fig.height=5,
+                      dev=c("png", "svg", "pdf"), dpi=300)
+```
+
+## Plotting theme and helpers
+
+```{r}
+#| label: plot_helpers
+
+save_plot <- function(path, plot, width, height, dpi = 500, bg = "white", full_save = FALSE, display = TRUE) {
+  if (full_save) {
+    extensions <- c("png", "svg", "tiff", "pdf")
+  } else {
+    extensions <- c("png")
+  }
+
+  for (ext in extensions) {
+    path_comnplete <- paste0(path, ".", ext)
+    ggsave(path_comnplete, plot,  width = width, height = height,  dpi = dpi, bg = bg)
+  }
+  if (display) {
+    plot
+  }
+}
+
+dir.create("figures", showWarnings = FALSE)
+
+plots_theme <-  theme_minimal(base_size = 14) +
+  theme(
+    plot.title          = element_text(face = "bold", size = rel(1.05)),
+    plot.title.position = "plot",
+    plot.caption        = element_text(color = "grey40", hjust = 0),
+    panel.grid.minor    = element_blank(),
+    strip.text          = element_text(face = "bold"),
+    legend.position     = "bottom",
+    panel.grid.major    = element_blank()
+  )
+
+theme_set(plots_theme)
+
+# Colours by reference type and taxonomic class.
+ref_palette <- c(
+  "Pine pathogen"      = "forestgreen",
+  "Plant pathogen"     = "steelblue",
+  "Animal pathogen"    = "firebrick",
+  "Saprophytic fungus" = "darkorchid",
+  "Common yeast"       = "darkorange1",
+  "This study"         = "black"
+)
+
+class_palette <- c(
+  "Dothideomycetes" = "#1B7837", "Eurotiomycetes"  = "#762A83",
+  "Sordariomycetes" = "#2166AC", "Leotiomycetes"   = "#D6604D",
+  "Saccharomycetes" = "#F1A340", "Tremellomycetes" = "#7F7F7F",
+  "Other"           = "darkorange1"
+)
+
+# Caption explaining the coloured sample labels on the x axis.
+label_caption <- paste(
+  "Sample labels colored by source:\n",
+  "green = pine pathogen, blue = plant pathogen, red = animal pathogen,\n",
+  "purple = saprophytic fungus, orange = common yeast, black = this study."
+)
+
+                        
+order_present <- function(samples, master_order) {
+  present <- unique(samples)
+  c(intersect(master_order, present), setdiff(present, master_order))
+}
+
+# Axis label colours matched to the plotted levels (sample or scientific name).
+axis_label_colors <- function(levels_present, ref_tbl, sci_name = F, by_class = F) {
+  
+  if (sci_name){
+  tibble(sci_plain = as.character(levels_present)) %>%
+    left_join(ref_tbl %>% select(sci_plain = sci_plain, ref_color = color),
+              by = "sci_plain") %>%
+    mutate(ref_color = replace_na(ref_color, ref_palette[["This study"]])) %>%
+    pull(ref_color)
+  } else {
+  tibble(sample = as.character(levels_present)) %>%
+    left_join(ref_tbl %>% select(sample = sample, ref_color = color),
+              by = "sample") %>%
+    mutate(ref_color = replace_na(ref_color, ref_palette[["This study"]])) %>%
+    pull(ref_color)
+  }
+}
+
+# Adaptive color ramp (cap at the 95th percentile so an outlier does not flatten).
+cap_colors <- function(mat) {
+  nz  <- mat[mat > 0]
+  cap <- if (length(nz)) ceiling(as.numeric(quantile(nz, 0.95))) else 1
+  cap <- max(cap, 1)
+  list(fun    = colorRamp2(c(0, cap), hcl_palette = "ag_GrnYl"),
+       at     = c(0, round(cap / 2), cap),
+       labels = c("0", as.character(round(cap / 2)), paste0(cap, "+")))
+}
+
+make_top_anno <- function(mat, ref_tbl) {
+  anno_tbl <- tibble(sample = colnames(mat)) %>%
+    left_join(ref_tbl %>% select(sample, class, reason), by = "sample") %>%
+    mutate(
+      reason = replace_na(reason, "This study"),
+      class  = replace_na(class, "Unclassified")
+    )
+
+  reason <- anno_tbl %>% pull(reason)
+  class  <- anno_tbl %>% pull(class)
+  
+  class_order <- names(class_palette[intersect(names(class_palette), unique(class))])
+  
+  HeatmapAnnotation(
+    class = class,
+    fungi = reason,
+    col = list(
+      class = class_palette[intersect(names(class_palette), unique(class))],
+      fungi = ref_palette[intersect(names(ref_palette), unique(reason))]
+    ),
+    annotation_label = c(class = "Taxonomic class", fungi = "Fungal type"),
+    annotation_legend_param = list(
+      class = list(title = "Taxonomic class", title_position = "topcenter", at = class_order),
+      fungi = list(title = "Fungal type", title_position = "topcenter")
+    )
+  )
+}
+
+# Sample-clustered heatmap, displayed and saved to figures/<file>.png.
+draw_heatmap <- function(mat, file, title = NULL, width = 20, height = 8,
+                         cluster_rows = TRUE) {
+  cols <- cap_colors(mat)
+  h <- Heatmap(
+    mat,
+    name  = "genes_per_1000",
+    col   = cols$fun,
+    cluster_rows        = cluster_rows,
+    show_row_dend       = FALSE,
+    cluster_columns     = TRUE,
+    show_column_names   = FALSE,
+    column_dend_height  = unit(3, "cm"),
+    row_gap             = unit(2, "mm"),
+    row_names_side      = "left",
+    row_names_max_width = unit(20, "cm"),
+    column_title        = title,
+    border              = TRUE,
+    top_annotation      = make_top_anno(mat, tax_info),
+    heatmap_legend_param = list(
+      title = "Genes per\n1000", title_position = "topcenter",
+      direction = "horizontal", legend_width = unit(3, "cm"),
+      at = cols$at, labels = cols$labels)
+  )
+  
+  h_plot <- draw(h, heatmap_legend_side = "right", annotation_legend_side = "right",
+       merge_legends = TRUE)
+  
+  png(file.path("figures", paste0(file, ".png")), width = width, height = height,
+      units = "in", res = 300)
+  draw(h, heatmap_legend_side = "right", annotation_legend_side = "right",
+       merge_legends = TRUE)
+  dev.off()
+  invisible(h)
+  
+  return(h_plot)
+}
+```
+
+## Data and statistics helpers
+
+```{r}
+#| label: data_helpers
+
+# Read a parser output from files/ and keep only the retained samples.
+read_parsed <- function(filename, retained = FALSE) {
+  path <- file.path("files", filename)
+  if (!file.exists(path)) {
+    stop("Required input missing: ", path,
+         "\n  Generate it with parse_funannotate_gff3_annotations.py and copy ",
+         "the CSV into files/.", call. = FALSE)
+  }
+  
+  df <- read_csv(path, show_col_types = FALSE)
+  if (!"sample" %in% names(df)) return(df)
+
+  doubled <- df$sample[str_detect(df$sample, "^(.+)_\\1$")]
+  if (length(doubled)) {
+    warning("Doubled sample names in ", filename, " (e.g. ", doubled[1],
+            "). Regenerate with the current parser.")
+  }
+  
+  if (length(retained) > 0) {
+    df %>% filter(sample %in% retained)
+  } else {
+    df
+  }
+}
+
+abbrev_binomial <- function(species) {
+  parts <- strsplit(trimws(species), "\\s+")
+  vapply(parts, function(p) {
+    if (length(p) < 2) return(p[1])
+    paste0(substr(p[1], 1, 1), ". ", paste(p[-1], collapse = " "))
+  }, character(1))
+}
+
+adonis_betadisper_concat <- function (adonis, betadisper, test_label) {
+  adonis |> 
+  as_tibble() |> slice_head(n = 2) |> rename_with(~ paste0("adonis_", .x)) |>
+                mutate(Term = c("class", "lifestyle"),
+                       Test = test_label, .before = 1) -> adonis_df
+  if (betadisper) {
+    anova(betadisper) |>
+      as_tibble() |> slice_head(n = 1) |> rename_with(~ paste0("betadisper_", .x)) |> 
+      mutate(Term = "class", .before=1) -> betadisper_df
+    
+    adonis_df |> left_join(betadisper_df, by = "Term")
+  } else {
+    adonis_df
+  }
+}
+
+pct_of <- function(x, v) 100 * mean(x < v) + 50 * mean(x == v)  # midrank percentile
+```
+
+## Reference metadata
+
+```{r}
+#| label: metadata
+
+ref_class <- c(
+  Lacicola = "Dothideomycetes", Dseptosporum = "Dothideomycetes",
+  Dsapinea = "Dothideomycetes", Ztritici = "Dothideomycetes",
+  Fcircinatum = "Sordariomycetes", Fgraminearum = "Sordariomycetes",
+  Poryzae = "Sordariomycetes",    Ncrassa = "Sordariomycetes",
+  Afumigatus = "Eurotiomycetes",  Bcinerea = "Leotiomycetes",
+  Calbicans = "Saccharomycetes",  Scerevisiae = "Saccharomycetes",
+  Cneoformans = "Tremellomycetes"
+)
+
+ref_lifestyle <- c(
+  Lacicola = "Pathogen", Dseptosporum = "Pathogen", Dsapinea = "Pathogen",
+  Ztritici = "Pathogen", Fcircinatum = "Pathogen", Fgraminearum = "Pathogen",
+  Poryzae = "Pathogen", Bcinerea = "Pathogen",
+  Afumigatus = "Saprophyte", Ncrassa = "Saprophyte",
+  Calbicans = "Yeast-like", Scerevisiae = "Yeast-like", Cneoformans = "Yeast-like"
+)
+
+YEAST_LIKE <- names(ref_lifestyle)[ref_lifestyle == "Yeast-like"]
+
+reference_samples <- read_csv("files/references.csv", show_col_types = FALSE) %>%
+  mutate(color = recode(reason, !!!ref_palette,
+                        .default = ref_palette[["This study"]]),
+            sci_plain = abbrev_binomial(species),
+            sci_expr  = sprintf('italic("%s")', sci_plain),
+            sci_md  = sprintf("*%s*", sci_plain))
+
+sci_name <- reference_samples |> 
+            select(sample,sci_plain,sci_expr,sci_md,color)
+```
+
+# Data processing and statistical analyses
+
+## QC
+
+### QC filtering
+
+```{r}
+#| label: qc_setup
+
+MIN_COMPLETE   <- 70   # BUSCO complete (%)   -- inclusive lower bound
+MAX_DUPLICATED <- 15   # BUSCO duplicated (%) -- exclusive upper bound
+
+busco   <- read_tsv("files/busco_summary.tsv", show_col_types = FALSE)
+quast   <- read_tsv("files/quast_summary.tsv", show_col_types = FALSE) |>
+            mutate(Assembly = str_remove(Assembly, ".links"))
+rptmask <- read_csv("files/repeatmasker_summary.csv", show_col_types = FALSE)
+
+qc_all <- busco %>%
+  left_join(quast,   by = c("sample_name" = "Assembly")) %>%
+  left_join(rptmask, by = c("sample_name" = "sample")) %>%
+  rename(sample = sample_name) |> 
+  mutate(
+    genome_size_mb = `Total length` / 1e6,
+    adj_genome_size_mb = ((`Total length` * (sc_percent /100)) / (c_percent /100)) / 1e6,
+    n50_kb         = N50 / 1e3,
+    passes_qc      = c_percent >= MIN_COMPLETE & mc_percent < MAX_DUPLICATED,
+    qc_status      = if_else(passes_qc, "Retained", "Excluded")
+  ) |>
+  rename(repeat_percent = bases_masked) |> left_join(sci_name) |> 
+  mutate(sample_type = ifelse(sample %in% reference_samples$sample, "ref", "isolate"),
+         sci_plain = case_when(sample_type == "isolate" ~ sample),
+         sci_expr = case_when(sample_type == "isolate" ~ sample),
+         sci_md = case_when(sample_type == "isolate" ~ gsub("_", "\\_", sample)))
+
+retained_samples <- c(qc_all %>% filter(passes_qc) %>% pull(sample))
+write(qc_all %>% filter(passes_qc) %>% pull(sample), file = "files/retained_samples.txt")
+
+name_scheme <- qc_all |> select(sample, sample_type, sci_plain, sci_expr, sci_md)
+sample_order <- c(
+  qc_all %>% filter(passes_qc) %>% arrange(desc(genome_size_mb)) %>% pull(sample)
+)
+
+message(sprintf("QC: %d of %d genomes retained (complete >= %d%%, duplicated < %d%%)",
+                length(retained_samples), nrow(qc_all), MIN_COMPLETE, MAX_DUPLICATED))
+```
+
+### QC summary statistics
+
+```{r}
+#| label: qc_stats
+
+qc_all |>
+  filter(sample_type == "isolate") |> 
+  summarise(mean_genome_size  =   mean(genome_size_mb),
+            medi_genome_size  = median(genome_size_mb),
+            mini_genome_size  =    min(genome_size_mb),
+            maxi_genome_size  =    max(genome_size_mb),
+            
+            mean_contigs  =   mean(`# contigs`),
+            medi_contigs  = median(`# contigs`),
+            mini_contigs  =    min(`# contigs`),
+            maxi_contigs  =    max(`# contigs`),
+            
+            mean_n50  =   mean(n50_kb),
+            medi_n50  = median(n50_kb),
+            mini_n50  =    min(n50_kb),
+            maxi_n50  =    max(n50_kb),
+            
+            mean_busco_c  =   mean(c_percent),
+            medi_busco_c  = median(c_percent),
+            mini_busco_c  =    min(c_percent),
+            maxi_busco_c  =    max(c_percent),
+            ) |> t()
+   
+```
+
+## Taxonomic placement from the tree
+
+```{r}
+#| label: taxonomic_placement
+#| warning: TRUE
+
+# Tree with branch lengths (patristic distances) and UFBoot support as node labels.
+
+tr <- read.tree("files/iqtree_outgroup_unpart_70_taxonomy.tree")
+tr$tip.label <- gsub("^'|'$", "", tr$tip.label)
+stopifnot("tip labels still contain a quote character after stripping" =
+          !any(grepl("'", tr$tip.label)))
+
+# Support values must be present as numeric node labels.
+if (is.null(tr$node.label) || all(is.na(suppressWarnings(as.numeric(tr$node.label))))) {
+  stop("This tree has no numeric node labels. Either it lacks support values ",
+       "(check IQ-TREE was run with -B/--alrt) or they are in a format ",
+       "as.numeric() cannot read. Inspect head(tr$node.label).")
+}
+n_lab_before <- sum(!is.na(suppressWarnings(as.numeric(tr$node.label))))
+
+# Root on the Basidiomycota outgroup.
+basid <- grep("^Basidiomycota", tr$tip.label, value = TRUE)
+stopifnot(length(basid) >= 2)
+tr <- root(tr, outgroup = basid, resolve.root = TRUE, edgelabel = TRUE)
+
+# Rooting can drop node labels; report how many were lost.
+supp <- suppressWarnings(as.numeric(tr$node.label))
+n_lab_after <- sum(!is.na(supp))
+cat(sprintf("node labels: %d before rooting, %d after (%d lost)\n",
+            n_lab_before, n_lab_after, n_lab_before - n_lab_after))
+if (n_lab_before - n_lab_after > 2) {
+  warning("Rerooting dropped more than two node labels. Support for placements ",
+          "near the root may be unreliable. Consider bipartition matching on ",
+          "the unrooted tree instead.")
+}
+
+is_ref   <- grepl("\\|", tr$tip.label)
+ref_tips <- tr$tip.label[is_ref]
+qry_tips <- setdiff(tr$tip.label[!is_ref], "Neurospora_crassa_genomic")
+
+D <- cophenetic.phylo(tr)
+
+# Split the pipe-delimited reference lineages into ranks.
+lineage <- function(x) trimws(strsplit(x, "\\|")[[1]])
+RANKS <- c("phylum", "class", "order", "family", "genus", "species")
+ref_lin <- do.call(rbind, lapply(ref_tips, function(x) {
+  l <- lineage(x); length(l) <- 6; l
+}))
+rownames(ref_lin) <- ref_tips
+colnames(ref_lin) <- RANKS
+
+# Rank calibration: patristic distances between reference pairs sharing each rank.
+pairs <- t(combn(ref_tips, 2))
+shared_rank <- apply(pairs, 1, function(p) {
+  a <- ref_lin[p[1], ]; b <- ref_lin[p[2], ]
+  sh <- NA
+  for (i in 1:5) if (!is.na(a[i]) && !is.na(b[i]) && a[i] == b[i]) sh <- RANKS[i] else break
+  sh
+})
+calib <- tibble(
+  rank = shared_rank,
+  d    = D[cbind(pairs[, 1], pairs[, 2])]
+) %>%
+  filter(!is.na(rank)) %>%
+  group_by(rank) %>%
+  summarise(n = n(), median_d = median(d), p10 = quantile(d, .1), p90 = quantile(d, .9))
+
+cat("\n=== Rank calibration: patristic distance between reference pairs ===\n")
+print(as.data.frame(calib))
+
+med <- setNames(calib$median_d, calib$rank)
+
+# UFBoot support of the smallest clade containing the query and at least one reference.
+ntip      <- length(tr$tip.label)
+root_node <- ntip + 1L
+
+support_for <- function(tip) {
+  i <- match(tip, tr$tip.label)
+  if (is.na(i)) return(NA_real_)
+  path <- rev(nodepath(tr, from = root_node, to = i))   # tip-to-root
+  path <- path[-1]                                      # drop the tip itself
+  for (nd in path) {
+    desc <- Descendants(tr, nd, type = "tips")[[1]]
+    if (any(grepl("\\|", tr$tip.label[desc]))) return(supp[nd - ntip])
+  }
+  NA_real_   # no ancestral clade contains a reference tip
+}
+
+# Nearest reference and minimum assignable rank for each query.
+placement <- map_dfr(qry_tips, function(q) {
+  d_to_refs <- D[q, ref_tips]
+  nearest   <- names(which.min(d_to_refs))
+  dmin      <- min(d_to_refs)
+  lin       <- ref_lin[nearest, ]
+  min_rank <- dplyr::case_when(
+    dmin < 0.020         ~ "species-level candidate",
+    dmin < med["genus"]  ~ "genus",
+    dmin < med["family"] ~ "genus (tentative)",
+    dmin < med["order"]  ~ "family",
+    dmin < med["class"]  ~ "order",
+    TRUE                 ~ "class"
+  )
+  tibble(sample = q, class = lin[["class"]], order = lin[["order"]],
+         family = lin[["family"]], nearest_reference = lin[["species"]],
+         patristic_dist = dmin, min_rank = min_rank,
+         UFBoot = support_for(q))
+})
+
+cat("\n=== Collection composition by class ===\n")
+print(table(placement$class))
+
+cat("\n=== Minimum assignable rank ===\n")
+print(placement |>
+        group_by(min_rank) |>
+        summarise(n_rank = n(), .groups = "drop") |>
+        arrange(desc(n_rank)))
+
+cat("\n=== UFBoot support for placements ===\n")
+print(summary(placement$UFBoot))
+cat("\nplacements with support < 95:\n")
+print(placement %>% filter(UFBoot < 95) %>%
+      select(sample, class, nearest_reference, patristic_dist, UFBoot))
+
+if (n_distinct(na.omit(placement$UFBoot)) <= 1) {
+  warning("All non-NA UFBoot values are identical, the signature of the ",
+          "root-collision bug. Verify the traversal before trusting these.")
+}
+if (any(is.na(placement$UFBoot))) {
+  cat(sprintf("\nNOTE: %d placement(s) have NA support:\n",
+              sum(is.na(placement$UFBoot))))
+  print(placement %>% filter(is.na(UFBoot)) %>%
+        select(sample, class, nearest_reference))
+}
+
+write_csv(placement, "files/taxonomic_placements_R.csv")
+```
+
+## Sample metadata (class and lifestyle)
+
+```{r}
+#| label: add_taxonomy
+
+allowed  <- c("Dothideomycetes",
+              "Eurotiomycetes",
+              "Sordariomycetes")
+
+tax_info <- placement |>
+              mutate(reason = "This study") |> 
+              bind_rows(reference_samples) |> 
+              select(sample, class, order, family, reason) |> 
+              mutate(class = ifelse(class %in% allowed, class, "Other"))
+
+meta <- tibble(sample = qc_all$sample) %>%
+          left_join(placement %>% select(sample, class), by = "sample") %>%
+          mutate(
+            class     = coalesce(class, ref_class[sample]),
+            lifestyle = coalesce(ref_lifestyle[sample], "Endophyte")
+          )
+
+stopifnot(!any(is.na(meta$class)))
+```
+
+## CAZy
+
+### CAZy family composition (PERMANOVA)
+
+```{r}
+#| label: permanova_cazy
+
+cazy_mat <- read_csv("files/matrix_cazy_family_per1000.csv", show_col_types = FALSE) %>%
+  column_to_rownames("sample")
+cazy_mat <- cazy_mat[, colSums(cazy_mat, na.rm = TRUE) > 0, drop = FALSE]
+cazy_mat[is.na(cazy_mat)] <- 0
+
+# Euclidean distance on Hellinger-transformed data is the Hellinger distance.
+hell <- decostand(cazy_mat, method = "hellinger")
+
+# Filamentous fungi only (yeast-like references excluded).
+keep <- meta$sample[!meta$sample %in% YEAST_LIKE]
+cazy_h  <- hell[keep, ]
+cazy_m  <- meta %>% filter(sample %in% keep) %>% arrange(match(sample, rownames(cazy_h)))
+cazy_d  <- vegdist(cazy_h, method = "euclidean")
+
+cat("=== PERMANOVA, filamentous fungi only (n =", length(keep), ") ===\n")
+cat("\n-- taxonomic class --\n")
+print(adonis2(cazy_d ~ class, data = cazy_m, permutations = N_PERM))
+cat("\n-- lifestyle --\n")
+print(adonis2(cazy_d ~ lifestyle, data = cazy_m, permutations = N_PERM))
+
+# Sequential terms: class is fitted before lifestyle.
+cat("\n-- class + lifestyle (sequential) --\n")
+print(adonis2(cazy_d ~ class + lifestyle, data = cazy_m, permutations = N_PERM, by = "terms" ))
+
+cat("\n=== betadisper (homogeneity of dispersion) ===\n")
+bd <- betadisper(cazy_d, cazy_m$class)
+print(anova(bd))
+
+dk  <- cazy_m$sample[cazy_m$class == "Dothideomycetes"]
+h_d <- hell[dk, ]
+m_d <- cazy_m %>% filter(sample %in% dk) %>%
+  arrange(match(sample, rownames(h_d)))
+
+cat("\n=== PERMANOVA within Dothideomycetes (n =", length(dk), ") ===\n")
+print(table(m_d$lifestyle))
+print(adonis2(vegdist(h_d, "euclidean") ~ lifestyle, data = m_d, permutations = N_PERM))
+
+sk  <- cazy_m$sample[cazy_m$lifestyle == "Endophyte"]
+m_s <- cazy_m %>% filter(sample %in% sk) %>% arrange(match(sample, rownames(hell[sk, ])))
+cat("\n=== PERMANOVA, study isolates only, by class (n =", length(sk), ") ===\n")
+print(adonis2(vegdist(hell[sk, ], "euclidean") ~ class, data = m_s, permutations = N_PERM))
+```
+
+### Fraction of CAZymes secreted
+
+```{r}
+#| label: cazy_secretion_stat
+
+sec_test_df <- read_csv("files/secreted_cazyme_summary.csv", show_col_types = FALSE) %>%
+  filter(!(secreted_cazyme_genes == 0 & nonsecreted_cazyme_genes == 0)) %>%
+  left_join(meta, by = "sample")
+
+dot_endo_sec <- sec_test_df %>%
+  filter(lifestyle == "Endophyte", class == "Dothideomycetes") %>%
+  pull(percent_of_cazymes_secreted)
+
+needle_sec <- sec_test_df %>%
+  filter(sample %in% c("Lacicola", "Dseptosporum")) %>%
+  pull(percent_of_cazymes_secreted)
+
+cat("=== Secreted CAZyme %: Dothideomycete endophytes vs the 2 needle specialists ===\n")
+cat(sprintf("  endophytes n = %d, median = %.1f%% ; pathogens = %s\n",
+            length(dot_endo_sec), median(dot_endo_sec),
+            paste(sprintf("%.1f%%", needle_sec), collapse = ", ")))
+print(wilcox.test(dot_endo_sec, needle_sec, exact = FALSE))
+
+cat(sprintf("  L. acicola percentile among matched endophytes = %.1f\n",
+            pct_of(dot_endo_sec,
+                   sec_test_df$percent_of_cazymes_secreted[sec_test_df$sample == "Lacicola"])))
+
+patho_sec <- sec_test_df %>%
+  filter(sample %in% c("Lacicola", "Dseptosporum", "Dsapinea", "Ztritici")) %>%
+  pull(percent_of_cazymes_secreted)
+
+cat("=== Secreted CAZyme %: Dothideomycete endophytes vs the 4 plant pathogens ===\n")
+cat(sprintf("  endophytes n = %d, median = %.1f%% ; pathogens = %s\n",
+            length(dot_endo_sec), median(dot_endo_sec),
+            paste(sprintf("%.1f%%", patho_sec), collapse = ", ")))
+print(wilcox.test(dot_endo_sec, patho_sec, exact = FALSE))
+
+# Descriptive only: % of CAZymes secreted by reference type and by class.
+
+sec_by_type <- read_csv("files/secreted_cazyme_summary.csv", show_col_types = FALSE) %>%
+  filter(!(secreted_cazyme_genes == 0 & nonsecreted_cazyme_genes == 0)) %>%
+  left_join(reference_samples %>% select(sample, reason), by = "sample") %>%
+  mutate(reason = replace_na(reason, "This study"))
+
+cat("=== % CAZymes secreted, whole collection by type ===\n")
+print(sec_by_type %>% group_by(reason) %>%
+      summarise(n = n(), mean_pct = round(mean(percent_of_cazymes_secreted), 1)) %>%
+      arrange(desc(mean_pct)))
+
+sec_cls <- read_csv("files/secreted_cazyme_summary.csv", show_col_types = FALSE) %>%
+  filter(!(secreted_cazyme_genes == 0 & nonsecreted_cazyme_genes == 0)) %>%
+  left_join(meta, by = "sample") %>%
+  filter(lifestyle == "Endophyte", !is.na(class))
+
+cat("=== % CAZymes secreted by class (study isolates) ===\n")
+print(sec_cls %>% group_by(class) %>%
+      summarise(n = n(),
+                mean = round(mean(percent_of_cazymes_secreted), 1),
+                median = round(median(percent_of_cazymes_secreted), 1),
+                min = round(min(percent_of_cazymes_secreted), 1),
+                max = round(max(percent_of_cazymes_secreted), 1)))
+
+cls_n <- sec_cls %>% count(class) %>% filter(n > 1) %>% pull(class)
+kw_sec <- sec_cls %>% filter(class %in% cls_n)
+print(kruskal.test(percent_of_cazymes_secreted ~ factor(class), data = kw_sec))
+print(pairwise.wilcox.test(kw_sec$percent_of_cazymes_secreted, factor(kw_sec$class),
+                           p.adjust.method = "BH", exact = FALSE))
+```
+
+### PCWDE: pathogen positions among matched Dothideomycetes
+
+```{r}
+#| label: pcwde_positions
+
+DOT_PATH <- c("Lacicola", "Dseptosporum", "Dsapinea", "Ztritici")
+NEEDLE   <- c("Lacicola", "Dseptosporum")
+
+positions <- function(tbl, traits, paths = DOT_PATH) {
+  dot <- tbl %>% filter(lifestyle == "Endophyte", class == "Dothideomycetes")
+  for (trait in traits) {
+    x <- dot[[trait]]
+    cat(sprintf("\n-- %s: Dothideomycete isolates n = %d, mean %.2f, median %.2f, range %.2f-%.2f\n",
+                trait, length(x), mean(x), median(x), min(x), max(x)))
+    for (p in paths) {
+      v <- tbl[[trait]][tbl$sample == p]
+      cat(sprintf("   %-13s %6.2f  percentile %5.1f  (isolates below: %d)\n",
+                  p, v, pct_of(x, v), sum(x < v)))
+    }
+    y <- tbl[[trait]][tbl$sample %in% NEEDLE]
+    w <- wilcox.test(x, y)
+    cat(sprintf("   Wilcoxon, 2 needle pathogens vs isolates: W = %.1f, p = %.4f\n",
+                w$statistic, w$p.value))
+  }
+}
+
+act <- read_csv("files/cazy_activity_group_counts.csv", show_col_types = FALSE)
+print(unique(act$activity_group))   # confirm these names match the vector below
+
+short <- c("Cellulose-associated (PCWDE)"           = "Cellulose",
+           "Hemicellulose / xylan-associated (PCWDE)" = "Hemicellulose",
+           "Mannan-associated (PCWDE)"               = "Mannan",
+           "Pectin-associated (PCWDE)"               = "Pectin")
+
+# Total PCWDE = cellulose + hemicellulose + mannan + pectin (cutin excluded).
+pcwde_wide <- act %>%
+  filter(activity_group %in% names(short)) %>%
+  mutate(trait = short[activity_group]) %>%
+  select(sample, trait, n_genes_per_1000) %>%
+  pivot_wider(names_from = trait, values_from = n_genes_per_1000, values_fill = 0) %>%
+  mutate(Total_PCWDE = Cellulose + Hemicellulose + Mannan + Pectin) %>%
+  left_join(meta, by = "sample")
+
+cat("=== total PCWDE by class, study isolates ===\n")
+print(pcwde_wide %>% filter(lifestyle == "Endophyte") %>%
+      group_by(class) %>%
+      summarise(n = n(), mean = round(mean(Total_PCWDE), 1),
+                min = round(min(Total_PCWDE), 1), max = round(max(Total_PCWDE), 1)))
+
+cat("\n=== minimum across ALL study isolates ===\n")
+print(pcwde_wide %>% filter(lifestyle == "Endophyte") %>%
+      summarise(across(c(Cellulose, Pectin, Total_PCWDE), ~round(min(.x), 2))))
+
+positions(pcwde_wide, c("Cellulose", "Pectin", "Hemicellulose", "Total_PCWDE"))
+```
+
+```{r}
+#| label: pathogen_percentiles
+
+pathogen_positions <- function(tbl, traits) {
+  denoms <- list(
+    "Dothideomycete isolates (matched)" =
+      tbl %>% filter(lifestyle == "Endophyte", class == "Dothideomycetes"),
+    "All study isolates (unmatched)" =
+      tbl %>% filter(lifestyle == "Endophyte"))
+
+  pct <- map_dfr(names(denoms), function(dn) {
+    map_dfr(traits, function(trait) {
+      x <- denoms[[dn]][[trait]]
+      map_dfr(DOT_PATH, function(s) {
+        v <- tbl[[trait]][tbl$sample == s]
+        tibble(denominator = dn, trait = trait, sample = s, value = v,
+               percentile = pct_of(x, v), n_below = sum(x < v),
+               n_equal = sum(x == v), n_isolates = length(x))
+      })
+    })
+  })
+
+  tests <- map_dfr(names(denoms), function(dn) {
+    map_dfr(traits, function(trait) {
+      x <- denoms[[dn]][[trait]]
+      y <- tbl[[trait]][tbl$sample %in% NEEDLE]
+      w <- wilcox.test(x, y)
+      tibble(denominator = dn, trait = trait, n_isolates = length(x),
+             mean = mean(x), median = median(x), min = min(x), max = max(x),
+             W = unname(w$statistic), p = w$p.value)
+    })
+  }) %>%
+    group_by(denominator) %>%
+    mutate(p_BH = p.adjust(p, "BH")) %>%
+    ungroup()
+
+  list(pct = pct, tests = tests)
+}
+
+traits <- c("Cellulose", "Pectin", "Hemicellulose", "Total_PCWDE")
+incl <- pathogen_positions(pcwde_wide, traits)
+
+cat("=== percentile of each Dothideomycete pathogen reference ===\n")
+print(incl$pct %>% mutate(across(c(value, percentile), ~round(.x, 2))), n = Inf)
+
+cat("\n=== needle specialists (2) vs isolates, two-sided Wilcoxon ===\n")
+print(incl$tests %>% mutate(across(c(mean, median, min, max), ~round(.x, 2)), p = signif(p, 3), p_BH = signif(p_BH, 3)), n = Inf)
+
+print(incl$tests %>% select(denominator, trait, p, p_BH) %>%
+      mutate(across(c(p, p_BH), ~signif(.x, 3))), n = Inf)
+```
+
+### PCWDE: robustness to double counting (inclusive vs exclusive counts)
+
+```{r}
+#| label: pcwde_robustness
+
+fam_map <- read_csv("files_unfiltered/cazy_family_activity_map.csv", show_col_types = FALSE) %>%
+  distinct(cazy_family, activity_group)
+n_groups <- fam_map %>% count(cazy_family, name = "n_groups")
+
+cat("=== families in more than one group, by map membership ===\n")
+print(fam_map %>% semi_join(filter(n_groups, n_groups > 1), by = "cazy_family") %>%
+      arrange(cazy_family, activity_group), n = Inf)
+
+# One row per gene and CAZy family.
+flat <- read_csv("files/gene_annotation_flat_table.csv", show_col_types = FALSE)
+cz <- flat %>%
+  filter(!is.na(cazy_families_norm), cazy_families_norm != "") %>%
+  select(sample, transcript_id, cazy_families_norm) %>%
+  separate_rows(cazy_families_norm, sep = ";") %>%
+  mutate(cazy_family = trimws(cazy_families_norm)) %>%
+  filter(cazy_family != "") %>%
+  distinct(sample, transcript_id, cazy_family)
+
+cat(sprintf("\nfamilies in the genomes but absent from the map: %d\n",
+            length(setdiff(unique(cz$cazy_family), fam_map$cazy_family))))
+
+tx <- cz %>%
+  inner_join(fam_map, by = "cazy_family") %>%
+  left_join(n_groups, by = "cazy_family")
+
+totals <- read_csv("files/product_summary.csv", show_col_types = FALSE) %>%
+  select(sample, total_genes = total_mrna_features)
+
+# A gene counts in a group (inclusive) if it has any family in it, and
+# (exclusive) if it has at least one family assigned to that group alone.
+grp_counts <- tx %>%
+  group_by(sample, transcript_id, activity_group) %>%
+  summarise(incl = 1L, excl = as.integer(any(n_groups == 1)), .groups = "drop") %>%
+  group_by(sample, activity_group) %>%
+  summarise(inclusive = sum(incl), exclusive = sum(excl), .groups = "drop") %>%
+  left_join(totals, by = "sample") %>%
+  mutate(across(c(inclusive, exclusive), ~ .x / total_genes * 1000)) %>%
+  select(-total_genes) %>%
+  complete(sample = totals$sample, activity_group = unique(fam_map$activity_group),
+           fill = list(inclusive = 0, exclusive = 0))
+
+# Inclusive counts should reproduce cazy_activity_group_counts.csv.
+chk <- grp_counts %>%
+  left_join(act %>% select(sample, activity_group, file_value = n_genes_per_1000),
+            by = c("sample", "activity_group"))
+cat(sprintf("\nmax |inclusive - file value| = %.4f\n",
+            max(abs(chk$inclusive - replace_na(chk$file_value, 0)))))
+
+# Unique-gene totals across the four PCWDE groups (no double counting).
+pc <- names(short)
+union_tot <- tibble(sample = totals$sample) %>%
+  left_join(tx %>% filter(activity_group %in% pc) %>%
+              distinct(sample, transcript_id) %>% count(sample, name = "n_incl"),
+            by = "sample") %>%
+  left_join(tx %>% filter(activity_group %in% pc, n_groups == 1) %>%
+              distinct(sample, transcript_id) %>% count(sample, name = "n_excl"),
+            by = "sample") %>%
+  left_join(totals, by = "sample") %>%
+  transmute(sample,
+            total_inclusive = replace_na(n_incl, 0L) / total_genes * 1000,
+            total_exclusive = replace_na(n_excl, 0L) / total_genes * 1000)
+
+make_wide <- function(col) {
+  grp_counts %>%
+    filter(activity_group %in% pc) %>%
+    mutate(trait = short[activity_group]) %>%
+    select(sample, trait, value = all_of(col)) %>%
+    pivot_wider(names_from = trait, values_from = value, values_fill = 0) %>%
+    left_join(union_tot %>% select(sample, Total_PCWDE = all_of(paste0("total_", col))),
+              by = "sample") %>%
+    left_join(meta, by = "sample")
+}
+
+# Summed vs unique-gene total PCWDE.
+incl_wide <- make_wide("inclusive")
+cat("\n=== total PCWDE: summed groups (previous) vs unique genes, by class ===\n")
+print(pcwde_wide %>% select(sample, Sum_total = Total_PCWDE) %>%
+      left_join(incl_wide %>% select(sample, Unique_total = Total_PCWDE, class, lifestyle),
+                by = "sample") %>%
+      filter(lifestyle == "Endophyte") %>%
+      group_by(class) %>%
+      summarise(n = n(), summed = round(mean(Sum_total), 1),
+                unique = round(mean(Unique_total), 1)))
+cat("\nDothideomycete references, summed vs unique total:\n")
+print(pcwde_wide %>% filter(sample %in% DOT_PATH) %>% select(sample, summed = Total_PCWDE) %>%
+      left_join(incl_wide %>% select(sample, unique = Total_PCWDE), by = "sample") %>%
+      mutate(across(where(is.numeric), ~round(.x, 2))))
+
+# Retention of each group under exclusive counting.
+cat("\n=== retention under exclusive counting ===\n")
+print(grp_counts %>%
+      group_by(activity_group) %>%
+      summarise(pct_retained_pooled = 100 * sum(exclusive) / sum(inclusive),
+                pct_retained_mean = 100 * mean(exclusive[inclusive > 0] / inclusive[inclusive > 0]),
+                r_pearson = suppressWarnings(cor(inclusive, exclusive)),
+                rho_spearman = suppressWarnings(cor(inclusive, exclusive, method = "spearman")),
+                .groups = "drop") %>%
+      mutate(across(where(is.numeric), ~round(.x, 3))), n = Inf)
+
+# Pathogen positions using exclusive counts.
+excl_wide <- make_wide("exclusive")
+excl <- pathogen_positions(excl_wide, c("Cellulose", "Pectin", "Hemicellulose", "Total_PCWDE"))
+
+cat("\n=== EXCLUSIVE counts, matched Dothideomycete comparison ===\n")
+print(excl$pct %>% filter(startsWith(denominator, "Dothideomycete")) %>%
+      mutate(across(c(value, percentile), ~round(.x, 2))), n = Inf)
+print(excl$tests %>% filter(startsWith(denominator, "Dothideomycete")) %>%
+      mutate(across(c(mean, median, min, max), ~round(.x, 2)),
+             p = signif(p, 3), p_BH = signif(p_BH, 3)), n = Inf)
+
+# Pathogen positions using unique-gene totals under inclusive counting.
+cat("\n=== INCLUSIVE counts with unique-gene total, matched comparison ===\n")
+incl_u <- pathogen_positions(incl_wide, c("Cellulose", "Pectin", "Total_PCWDE"))
+print(incl_u$tests %>% filter(startsWith(denominator, "Dothideomycete")) %>%
+      mutate(across(c(mean, median, min, max), ~round(.x, 2)),
+             p = signif(p, 3), p_BH = signif(p_BH, 3)), n = Inf)
+```
+
+### PCWDE: unique-gene totals
+
+```{r}
+#| label: pcwde_unique_totals
+
+pcwde_wide <- incl_wide   # unique-gene total replaces the summed total
+incl <- pathogen_positions(pcwde_wide, c("Cellulose", "Pectin", "Hemicellulose", "Total_PCWDE"))
+
+cat("=== unique-gene total PCWDE by class, study isolates ===\n")
+print(pcwde_wide %>% filter(lifestyle == "Endophyte") %>%
+      group_by(class) %>%
+      summarise(n = n(), mean = round(mean(Total_PCWDE), 1),
+                min = round(min(Total_PCWDE), 1), max = round(max(Total_PCWDE), 1)))
+
+print(incl$pct %>% filter(startsWith(denominator, "Dothideomycete"), trait == "Total_PCWDE") %>%
+      mutate(across(c(value, percentile), ~round(.x, 2))))
+print(incl$tests %>% filter(startsWith(denominator, "Dothideomycete")) %>%
+      select(trait, W, p, p_BH) %>% mutate(across(c(p, p_BH), ~signif(.x, 3))))
+print(excl$tests %>% filter(startsWith(denominator, "Dothideomycete")) %>%
+      select(trait, W, p, p_BH) %>% mutate(across(c(p, p_BH), ~signif(.x, 3))))
+```
+
+## Secretome
+
+### Effectors (EffectorP)
+
+```{r}
+#| label: effector_tests
+
+eff_sum <- read_csv("files/effectorp_summary.csv", show_col_types = FALSE) %>%
+  left_join(meta, by = "sample")
+
+# The matched comparison needs EffectorP results for both needle pathogens.
+refs_present <- eff_sum %>% filter(lifestyle != "Endophyte") %>% pull(sample)
+needle       <- intersect(c("Lacicola", "Dseptosporum"), eff_sum$sample)
+
+cat(sprintf("genomes with EffectorP results: %d (%d endophytes, %d references)\n",
+            nrow(eff_sum), sum(eff_sum$lifestyle == "Endophyte"), length(refs_present)))
+cat("reference genomes present:", paste(refs_present, collapse = ", "), "\n")
+
+if (length(needle) < 2) {
+  stop("EffectorP results are missing for ", 
+       paste(setdiff(c("Lacicola", "Dseptosporum"), eff_sum$sample), collapse = " and "),
+       ". The matched pathogen comparison cannot be run. Either run EffectorP on ",
+       "the reference genomes, or drop effector claims from the paper.")
+}
+
+# n_proteins_screened is the secretome after the TM filter (EffectorP input).
+eff_sum <- eff_sum %>%
+  mutate(
+    secretome_per_1000 = n_proteins_screened / total_genes * 1000,
+    effectors_per_1000 = n_effectors / total_genes * 1000,
+    pct_secretome_effector = 100 * n_effectors / n_proteins_screened
+  )
+
+cat("\n=== per-genome rates by lifestyle ===\n")
+print(eff_sum %>% group_by(lifestyle) %>%
+      summarise(n = n(),
+                secretome_per_1000 = round(mean(secretome_per_1000), 2),
+                effectors_per_1000 = round(mean(effectors_per_1000), 2),
+                pct_secretome_effector = round(mean(pct_secretome_effector), 1)))
+
+# Effector content by taxonomic class (study isolates).
+eff_study <- eff_sum %>% filter(lifestyle == "Endophyte", !is.na(class))
+cls_n <- eff_study %>% count(class) %>% filter(n > 1) %>% pull(class)
+kw_eff <- eff_study %>% filter(class %in% cls_n)
+
+cat("\n=== effector content by taxonomic class (study isolates) ===\n")
+print(kw_eff %>% group_by(class) %>%
+      summarise(n = n(),
+                median_eff_per_1000 = round(median(effectors_per_1000), 2),
+                median_sec_per_1000 = round(median(secretome_per_1000), 2)))
+
+cat("\n-- effectors per 1000 genes ~ class --\n")
+print(kruskal.test(effectors_per_1000 ~ factor(class), data = kw_eff))
+print(pairwise.wilcox.test(kw_eff$effectors_per_1000, factor(kw_eff$class),
+                           p.adjust.method = "BH", exact = FALSE))
+
+cat("\n-- secretome size per 1000 genes ~ class --\n")
+print(kruskal.test(secretome_per_1000 ~ factor(class), data = kw_eff))
+
+# Dothideomycete endophytes vs needle pathogens.
+dot_endo <- eff_sum %>% filter(lifestyle == "Endophyte", class == "Dothideomycetes")
+path_row <- eff_sum %>% filter(sample %in% needle)
+
+cat(sprintf("\n=== matched comparison: %d Dothideomycete endophytes vs %d needle specialists ===\n",
+            nrow(dot_endo), nrow(path_row)))
+
+for (v in c("secretome_per_1000", "effectors_per_1000", "pct_secretome_effector")) {
+  x <- dot_endo[[v]]
+  y <- path_row[[v]]
+  w <- wilcox.test(x, y, exact = FALSE)
+  cat(sprintf("\n  %s\n", v))
+  cat(sprintf("    endophytes: median %.2f [%.2f - %.2f]\n",
+              median(x), min(x), max(x)))
+  for (i in seq_len(nrow(path_row))) {
+    cat(sprintf("    %-14s %.2f  (percentile %.1f)\n",
+                path_row$sample[i], y[i], pct_of(x, y[i])))
+  }
+  cat(sprintf("    Wilcoxon W = %.1f, p = %.3f\n", w$statistic, w$p.value))
+}
+
+# Effector class composition (apoplastic / cytoplasmic / dual).
+eff_cls <- read_csv("files/effectorp_class_counts.csv", show_col_types = FALSE) %>%
+  filter(effector_class != "Non-effector") %>%
+  select(sample, effector_class, n_genes) %>%
+  pivot_wider(names_from = effector_class, values_from = n_genes, values_fill = 0) %>%
+  column_to_rownames("sample")
+eff_cls <- eff_cls[rowSums(eff_cls) > 0, colSums(eff_cls) > 0, drop = FALSE]
+
+eff_meta <- meta %>%
+  filter(sample %in% rownames(eff_cls), !sample %in% YEAST_LIKE) %>%
+  arrange(match(sample, rownames(eff_cls)))
+eff_h <- decostand(eff_cls[eff_meta$sample, ], method = "hellinger")
+eff_d <- vegdist(eff_h, method = "euclidean")
+
+cat(sprintf("\n=== PERMANOVA on effector class composition (%d categories, n = %d) ===\n",
+            ncol(eff_cls), nrow(eff_h)))
+print(adonis2(eff_d ~ class,     data = eff_meta, permutations = N_PERM))
+print(adonis2(eff_d ~ lifestyle, data = eff_meta, permutations = N_PERM))
+print(adonis2(eff_d ~ class + lifestyle, data = eff_meta, permutations = N_PERM, by = "terms"))
+cat("\n-- dispersion check (as for CAZy and BGC) --\n")
+print(anova(betadisper(eff_d, eff_meta$class)))
+print(anova(betadisper(eff_d, eff_meta$lifestyle)))
+
+# Effectors are a subset of the secretome: check whether effector counts only
+# track secretome size.
+ct <- cor.test(eff_sum$secretome_per_1000, eff_sum$effectors_per_1000,
+               method = "spearman", exact = FALSE)
+cat(sprintf("\n=== nesting check ===\n  secretome size vs effector count: rho = %+.3f, p = %.3g\n",
+            ct$estimate, ct$p.value))
+ct2 <- cor.test(eff_sum$secretome_per_1000, eff_sum$pct_secretome_effector,
+                method = "spearman", exact = FALSE)
+cat(sprintf("  secretome size vs effector FRACTION: rho = %+.3f, p = %.3g\n",
+            ct2$estimate, ct2$p.value))
+cat("  If the first is strong and the second is near zero, effector count is\n")
+cat("  largely tracking secretome size and the two should not be reported as\n")
+cat("  independent results.\n")
+```
+
+### Secreted CAZy composition
+
+```{r}
+#| label: secreted_cazy_matrix
+
+# Secreted CAZymes only. This is a subset of the full CAZy matrix, so it is
+# analysed separately and not added to the combined matrix.
+
+flat <- read_csv("files/gene_annotation_flat_table.csv", show_col_types = FALSE)
+
+# passed_tm_filter: NA = not screened, TRUE = secreted, FALSE = membrane-bound.
+secreted <- flat %>%
+  filter(!is.na(passed_tm_filter), passed_tm_filter) %>%
+  filter(!is.na(cazy_families_norm), cazy_families_norm != "")
+
+cat(sprintf("secreted transcripts with a CAZy assignment: %d across %d genomes\n",
+            nrow(secreted), n_distinct(secreted$sample)))
+
+# Genomes without secretome coverage are missing data, not zeros.
+no_coverage <- flat %>%
+  group_by(sample) %>%
+  summarise(any_assessed = any(secretome_assessed), .groups = "drop") %>%
+  filter(!any_assessed) %>% pull(sample)
+if (length(no_coverage)) {
+  cat(sprintf("EXCLUDED, no secretome coverage (missing data, not zero): %s\n",
+              paste(no_coverage, collapse = ", ")))
+}
+
+# cazy_families_norm is ';'-delimited.
+sec_long <- secreted %>%
+  select(sample, transcript_id, cazy_families_norm) %>%
+  separate_rows(cazy_families_norm, sep = ";") %>%
+  mutate(cazy_family = trimws(cazy_families_norm)) %>%
+  filter(cazy_family != "") %>%
+  distinct(sample, transcript_id, cazy_family)
+
+totals <- read_csv("files/product_summary.csv", show_col_types = FALSE) %>%
+  select(sample, total_genes = total_mrna_features)
+
+sec_counts <- sec_long %>%
+  count(sample, cazy_family, name = "n_genes") %>%
+  left_join(totals, by = "sample") %>%
+  mutate(per_1000 = n_genes / total_genes * 1000)
+
+write_csv(sec_counts, "files/secreted_cazy_family_counts.csv")
+
+sec_mat <- sec_counts %>%
+  select(sample, cazy_family, per_1000) %>%
+  pivot_wider(names_from = cazy_family, values_from = per_1000, values_fill = 0) %>%
+  filter(!sample %in% no_coverage) %>%
+  column_to_rownames("sample")
+
+cat(sprintf("secreted-CAZy matrix: %d genomes x %d families\n",
+            nrow(sec_mat), ncol(sec_mat)))
+cat(sprintf("  (full CAZy matrix for comparison: %d x %d)\n",
+            nrow(cazy_mat), ncol(cazy_mat)))
+```
+
+```{r}
+#| label: secreted_cazy_tests
+
+sec_meta <- meta %>%
+  filter(sample %in% rownames(sec_mat), !sample %in% YEAST_LIKE) %>%
+  arrange(match(sample, rownames(sec_mat)))
+sec_h <- decostand(sec_mat[sec_meta$sample, ], method = "hellinger")
+sec_d <- vegdist(sec_h, method = "euclidean")
+
+cat(sprintf("=== PERMANOVA on secreted CAZy composition (n = %d) ===\n", nrow(sec_h)))
+cat("\n-- taxonomic class --\n")
+print(adonis2(sec_d ~ class, data = sec_meta, permutations = N_PERM))
+cat("\n-- lifestyle --\n")
+print(adonis2(sec_d ~ lifestyle, data = sec_meta, permutations = N_PERM))
+cat("\n-- class + lifestyle (sequential, class first) --\n")
+print(adonis2(sec_d ~ class + lifestyle, data = sec_meta,
+              permutations = N_PERM, by = "terms"))
+cat("\n-- dispersion check --\n")
+print(anova(betadisper(sec_d, sec_meta$class)))
+
+# Secretome size fitted first as a covariate.
+sec_size <- read_csv("files/effectorp_summary.csv", show_col_types = FALSE) %>%
+  mutate(secretome_per_1000 = n_proteins_screened / total_genes * 1000) %>%
+  select(sample, secretome_per_1000)
+
+sec_meta2 <- sec_meta %>% left_join(sec_size, by = "sample")
+if (any(is.na(sec_meta2$secretome_per_1000))) {
+  warning(sum(is.na(sec_meta2$secretome_per_1000)),
+          " genome(s) lack a secretome size value; covariate model skipped for them.")
+}
+ok <- !is.na(sec_meta2$secretome_per_1000)
+cat("\n-- secretome size + class + lifestyle (sequential) --\n")
+print(adonis2(vegdist(sec_h[ok, ], "euclidean") ~ secretome_per_1000 + class + lifestyle,
+              data = sec_meta2[ok, ], permutations = N_PERM, by = "terms"))
+
+# Dothideomycete endophytes vs needle pathogens.
+sec_group <- sec_counts %>%
+  filter(!sample %in% no_coverage) %>%
+  group_by(sample) %>%
+  summarise(secreted_cazy_per_1000 = sum(per_1000), .groups = "drop") %>%
+  left_join(meta, by = "sample")
+
+dot_e <- sec_group %>% filter(lifestyle == "Endophyte", class == "Dothideomycetes")
+needle <- sec_group %>% filter(sample %in% c("Lacicola", "Dseptosporum"))
+
+cat(sprintf("\n=== total secreted CAZyme content: %d Dothideomycete endophytes vs %d needle specialists ===\n",
+            nrow(dot_e), nrow(needle)))
+cat(sprintf("  endophytes: median %.2f [%.2f - %.2f]\n",
+            median(dot_e$secreted_cazy_per_1000),
+            min(dot_e$secreted_cazy_per_1000), max(dot_e$secreted_cazy_per_1000)))
+for (i in seq_len(nrow(needle))) {
+  cat(sprintf("  %-14s %.2f  (percentile %.1f)\n", needle$sample[i],
+              needle$secreted_cazy_per_1000[i],
+              pct_of(dot_e$secreted_cazy_per_1000, needle$secreted_cazy_per_1000[i])))
+}
+print(wilcox.test(dot_e$secreted_cazy_per_1000, needle$secreted_cazy_per_1000,
+                  exact = FALSE))
+
+cat("\n=== by class (study isolates) ===\n")
+print(sec_group %>% filter(lifestyle == "Endophyte", !is.na(class)) %>%
+      group_by(class) %>%
+      summarise(n = n(), median = round(median(secreted_cazy_per_1000), 2)))
+
+cat("=== betadisper on LIFESTYLE (the factor the new claim rests on) ===\n")
+print(anova(betadisper(sec_d, sec_meta$lifestyle)))
+
+# Which families drive the lifestyle signal, and in which direction?
+sec_rel <- sweep(sec_mat[sec_meta$sample, ], 1, rowSums(sec_mat[sec_meta$sample, ]), "/")
+fam_test <- map_dfr(colnames(sec_rel), function(f) {
+  d <- tibble(v = sec_rel[, f], lifestyle = sec_meta$lifestyle) %>%
+    filter(lifestyle %in% c("Endophyte", "Pathogen"))
+  if (sum(d$v > 0) < 5) return(NULL)
+  w <- wilcox.test(v ~ lifestyle, data = d, exact = FALSE)
+  tibble(family = f, p = w$p.value,
+         endophyte = mean(d$v[d$lifestyle == "Endophyte"]),
+         pathogen  = mean(d$v[d$lifestyle == "Pathogen"]))
+}) %>%
+  mutate(p_adj = p.adjust(p, "BH"),
+         direction = if_else(pathogen > endophyte, "higher in pathogens",
+                             "higher in endophytes")) %>%
+  arrange(p_adj)
+
+cat("\n=== families differing by lifestyle (BH-adjusted, top 15) ===\n")
+print(fam_test %>% head(15) %>%
+      mutate(across(c(endophyte, pathogen), ~round(.x, 4)),
+             p_adj = signif(p_adj, 3)))
+cat(sprintf("\nfamilies with p_adj < 0.05: %d of %d tested\n",
+            sum(fam_test$p_adj < 0.05), nrow(fam_test)))
+```
+
+## COG
+
+```{r}
+#| label: cog_stats
+
+# COG profiles, filamentous fungi only.
+
+cog_raw <- read_parsed("cog_category_counts.csv", retained_samples)
+
+cog_mat <- cog_raw %>%
+  select(sample, category, count_per_1000_genes) %>%
+  pivot_wider(names_from = category, values_from = count_per_1000_genes,
+              values_fill = 0) %>%
+  column_to_rownames("sample")
+cog_mat <- cog_mat[, colSums(cog_mat) > 0, drop = FALSE]
+
+cog_meta <- meta %>%
+  filter(sample %in% rownames(cog_mat), !sample %in% YEAST_LIKE) %>%
+  arrange(match(sample, rownames(cog_mat)))
+cog_h <- decostand(cog_mat[cog_meta$sample, ], method = "hellinger")
+cog_d <- vegdist(cog_h, method = "euclidean")
+
+cat("=== PERMANOVA on COG profiles, filamentous only (n =", nrow(cog_h), ") ===\n")
+cat("\n-- lifestyle --\n")
+print(adonis2(cog_d ~ lifestyle, data = cog_meta, permutations = N_PERM))
+cat("\n-- taxonomic class --\n")
+print(adonis2(cog_d ~ class, data = cog_meta, permutations = N_PERM))
+cat("\n-- lifestyle + taxonomic class --\n")
+print(adonis2(cog_d ~ class + lifestyle, data = cog_meta, permutations = N_PERM, by = "terms"))
+cat("\n-- dispersion check --\n")
+print(anova(betadisper(cog_d, cog_meta$class)))
+
+# Dothideomycetes only: endophytes vs pathogens.
+
+cog_dot <- cog_meta %>% filter(class == "Dothideomycetes")
+cog_h_dot <- cog_h[cog_dot$sample, , drop = FALSE]
+
+cog_dot <- cog_dot %>%
+  mutate(grp = if_else(lifestyle == "Pathogen", "Pathogen", "Endophyte"))
+
+cat("=== PERMANOVA on COG profiles, Dothideomycetes only (n =", nrow(cog_h_dot), ") ===\n")
+print(table(cog_dot$grp))
+print(adonis2(vegdist(cog_h_dot, "euclidean") ~ grp,
+              data = cog_dot, permutations = N_PERM))
+
+cat("\n-- dispersion check --\n")
+print(anova(betadisper(vegdist(cog_h_dot, "euclidean"), cog_dot$grp)))
+
+# Per-category Wilcoxon tests, BH-corrected.
+dot_endo_cog <- cog_mat[cog_dot$sample[cog_dot$grp == "Endophyte"], , drop = FALSE]
+needle_cog   <- cog_mat[intersect(c("Lacicola", "Dseptosporum"), rownames(cog_mat)), , drop = FALSE]
+
+cat("\n=== per-category Wilcoxon, BH-corrected ===\n")
+cog_p <- sapply(colnames(cog_mat), function(cat_i) {
+  wilcox.test(dot_endo_cog[, cat_i], needle_cog[, cat_i], exact = FALSE)$p.value
+})
+print(tibble(category = names(cog_p),
+             endo_median = round(apply(dot_endo_cog, 2, median), 2),
+             needle = apply(needle_cog, 2, function(x) paste(round(x, 2), collapse = "/")),
+             p_adj = round(p.adjust(cog_p, method = "BH"), 3)) %>%
+      arrange(p_adj))
+```
+
+## BGC
+
+### BGC counts by class and matched comparison
+
+```{r}
+#| label: bgc_counts
+
+bgc_raw <- read_parsed("antismash_bgc_class_counts.csv", retained_samples)
+
+bgc_tot <- bgc_raw %>%
+  group_by(sample) %>% summarise(n_bgc = sum(n_regions), .groups = "drop") %>%
+  left_join(meta, by = "sample")
+
+cat("=== BGC totals, study isolates by class ===\n")
+print(bgc_tot %>% filter(lifestyle == "Endophyte") %>%
+      group_by(class) %>%
+      summarise(n = n(), mean = mean(n_bgc), min = min(n_bgc), max = max(n_bgc)))
+
+cat("\n=== Dothideomycete references, percentile within matched endophytes ===\n")
+dot_endo <- bgc_tot$n_bgc[bgc_tot$lifestyle == "Endophyte" & bgc_tot$class == "Dothideomycetes"]
+for (r in c("Lacicola", "Dseptosporum", "Dsapinea", "Ztritici")) {
+  v <- bgc_tot$n_bgc[bgc_tot$sample == r]
+  cat(sprintf("  %-14s %3d clusters  percentile = %.1f\n", r, v, pct_of(dot_endo, v)))
+}
+
+cat("\n=== naive (unmatched) comparison, for contrast ===\n")
+cat(sprintf("  all study isolates mean = %.1f ; pine pathogens mean = %.1f\n",
+            mean(bgc_tot$n_bgc[bgc_tot$lifestyle == "Endophyte"]),
+            mean(bgc_tot$n_bgc[bgc_tot$sample %in%
+                 c("Lacicola", "Dseptosporum", "Dsapinea", "Fcircinatum")])))
+
+bgc_study <- bgc_tot %>%
+  filter(lifestyle == "Endophyte", !is.na(class))
+
+# Kruskal-Wallis on classes with more than one isolate.
+cls_n <- bgc_study %>% count(class) %>% filter(n > 1) %>% pull(class)
+kw_dat <- bgc_study %>% filter(class %in% cls_n)
+
+cat("=== BGC count ~ taxonomic class (study isolates) ===\n")
+print(kw_dat %>% group_by(class) %>%
+      summarise(n = n(), median = median(n_bgc), mean = round(mean(n_bgc), 1)))
+print(kruskal.test(n_bgc ~ factor(class), data = kw_dat))
+
+cat("\n=== pairwise Wilcoxon, Benjamini-Hochberg corrected ===\n")
+print(pairwise.wilcox.test(kw_dat$n_bgc, factor(kw_dat$class),
+                           p.adjust.method = "BH", exact = FALSE))
+
+# Dothideomycete endophytes vs needle pathogens.
+dot_endo <- bgc_study %>% filter(class == "Dothideomycetes") %>% pull(n_bgc)
+needle   <- bgc_tot %>% filter(sample %in% c("Lacicola", "Dseptosporum")) %>% pull(n_bgc)
+
+cat("\n=== BGC count: Dothideomycete endophytes vs the 2 needle specialists ===\n")
+cat(sprintf("  endophytes n = %d, median = %.0f ; pathogens = %s\n",
+            length(dot_endo), median(dot_endo), paste(needle, collapse = ", ")))
+print(wilcox.test(dot_endo, needle, exact = FALSE))
+cat(sprintf("  L. acicola percentile among matched endophytes = %.1f\n",
+            pct_of(dot_endo, bgc_tot$n_bgc[bgc_tot$sample == "Lacicola"])))
+```
+
+### BGC class composition (PERMANOVA)
+
+```{r}
+#| label: bgc_composition
+
+bgc_mat <- bgc_raw %>%
+  select(sample, bgc_class, n_regions_per_1000) %>%
+  pivot_wider(names_from = bgc_class, values_from = n_regions_per_1000,
+              values_fill = 0) %>%
+  column_to_rownames("sample")
+bgc_mat <- bgc_mat[, colSums(bgc_mat) > 0, drop = FALSE]
+
+bgc_meta <- meta %>%
+  filter(sample %in% rownames(bgc_mat), !sample %in% YEAST_LIKE) %>%
+  arrange(match(sample, rownames(bgc_mat)))
+bgc_h <- decostand(bgc_mat[bgc_meta$sample, ], method = "hellinger")
+bgc_d <- vegdist(bgc_h, method = "euclidean")
+
+cat("\n=== PERMANOVA on BGC class composition, filamentous only (n =",
+    nrow(bgc_h), ") ===\n")
+print(adonis2(bgc_d ~ class,     data = bgc_meta, permutations = N_PERM))
+print(adonis2(bgc_d ~ lifestyle, data = bgc_meta, permutations = N_PERM))
+print(adonis2(bgc_d ~ class + lifestyle, data = bgc_meta, permutations = N_PERM, by = "terms"))
+print(anova(betadisper(bgc_d, bgc_meta$class)))
+```
+
+### Assembly contiguity vs BGC counts
+
+```{r}
+#| label: bgc_contiguity
+
+reg <- read_csv("files/antismash_regions_long.csv", show_col_types = FALSE)
+per <- reg %>% group_by(sample) %>%
+  summarise(n_bgc = n(), pct_edge = 100 * mean(contig_edge), .groups = "drop")
+
+q <- read_tsv("files/quast_summary.tsv", show_col_types = FALSE) %>%
+  mutate(Assembly = str_remove(Assembly, ".masked")) %>%
+  select(sample = Assembly, n_contigs = `# contigs`, N50)
+
+cg <- per %>% inner_join(q, by = "sample") %>%
+  filter(sample %in% placement$sample)   # study isolates only
+
+cat("=== Spearman correlations, study isolates (n =", nrow(cg), ") ===\n")
+for (x in c("n_contigs", "N50")) for (y in c("pct_edge", "n_bgc")) {
+  ct <- cor.test(cg[[x]], cg[[y]], method = "spearman", exact = FALSE)
+  cat(sprintf("  %-10s vs %-9s rho = %+.3f  p = %.3g\n", x, y, ct$estimate, ct$p.value))
+}
+
+cat("\n=== BGC count by contiguity tertile ===\n")
+print(cg %>% mutate(tertile = ntile(n_contigs, 3)) %>%
+      group_by(tertile) %>%
+      summarise(n = n(), median_contigs = median(n_contigs),
+                mean_bgc = mean(n_bgc), pct_edge = mean(pct_edge)))
+```
+
+## Combined functional matrix (CAZy + COG + BGC)
+
+```{r}
+#| label: combined_stats
+
+# Sample x feature matrices (per 1000 genes) for each block.
+load_block <- function(path, value_col, feature_col) {
+  read_csv(path, show_col_types = FALSE) %>%
+    select(sample, feature = all_of(feature_col), value = all_of(value_col)) %>%
+    pivot_wider(names_from = feature, values_from = value, values_fill = 0) %>%
+    column_to_rownames("sample") %>%
+    as.matrix()
+}
+
+blk_cazy <- load_block("files/cazy_family_counts.csv",
+                       "count_per_1000_genes", "cazy_family")
+blk_cog  <- load_block("files/cog_category_counts.csv",
+                       "count_per_1000_genes", "category")
+blk_bgc  <- load_block("files/antismash_bgc_class_counts.csv",
+                       "n_regions_per_1000", "bgc_class")
+
+common <- Reduce(intersect, list(rownames(blk_cazy), rownames(blk_cog), rownames(blk_bgc)))
+cat(sprintf("samples with all three blocks: %d\n", length(common)))
+blk_cazy <- blk_cazy[common, , drop = FALSE]
+blk_cog  <- blk_cog[common, , drop = FALSE]
+blk_bgc  <- blk_bgc[common, , drop = FALSE]
+
+# Drop all-zero columns in each block.
+drop_empty <- function(m) m[, colSums(m, na.rm = TRUE) > 0, drop = FALSE]
+blk_cazy <- drop_empty(blk_cazy)
+blk_cog  <- drop_empty(blk_cog)
+blk_bgc  <- drop_empty(blk_bgc)
+
+cat(sprintf("block dimensions: CAZy %d vars, COG %d vars, BGC %d vars\n",
+            ncol(blk_cazy), ncol(blk_cog), ncol(blk_bgc)))
+
+# Hellinger transform each block separately.
+hell_cazy <- decostand(blk_cazy, method = "hellinger")
+hell_cog  <- decostand(blk_cog,  method = "hellinger")
+hell_bgc  <- decostand(blk_bgc,  method = "hellinger")
+
+# MFA block weighting: scale each block by 1 / its first singular value
+# (Escofier & Pages, 1994).
+block_weight <- function(m) {
+  sv1 <- svd(scale(m, center = TRUE, scale = FALSE), nu = 0, nv = 0)$d[1]
+  1 / sv1
+}
+w_cazy <- block_weight(hell_cazy)
+w_cog  <- block_weight(hell_cog)
+w_bgc  <- block_weight(hell_bgc)
+
+cat(sprintf("block weights (1/first singular value): CAZy %.3f  COG %.3f  BGC %.3f\n",
+            w_cazy, w_cog, w_bgc))
+
+combined <- cbind(hell_cazy * w_cazy, hell_cog * w_cog, hell_bgc * w_bgc)
+block_id <- c(rep("CAZy", ncol(hell_cazy)),
+             rep("COG",  ncol(hell_cog)),
+             rep("BGC",  ncol(hell_bgc)))
+
+# PERMANOVA on the combined matrix, filamentous fungi only.
+meta_c <- meta %>% filter(sample %in% common) %>% arrange(match(sample, rownames(combined)))
+keep_c <- meta_c$sample[!meta_c$sample %in% YEAST_LIKE]
+combined_f <- combined[keep_c, , drop = FALSE]
+meta_cf    <- meta_c %>% filter(sample %in% keep_c)
+
+combined_d <- vegdist(combined_f, method = "euclidean")
+
+cat("\n=== PERMANOVA on the COMBINED matrix (CAZy + COG + BGC), filamentous fungi only (n =",
+    length(keep_c), ") ===\n")
+cat("\n-- taxonomic class --\n")
+print(adonis2(combined_d ~ class, data = meta_cf, permutations = N_PERM))
+cat("\n-- lifestyle --\n")
+print(adonis2(combined_d ~ lifestyle, data = meta_cf, permutations = N_PERM))
+cat("\n-- class + lifestyle (sequential) --\n")
+print(adonis2(combined_d ~ class + lifestyle, data = meta_cf, permutations = N_PERM, by = "terms"))
+
+cat("\n=== betadisper on the combined matrix ===\n")
+print(anova(betadisper(combined_d, meta_cf$class)))
+```
+
+## Dispersion by lifestyle (betadisper)
+
+```{r}
+#| label: betadisper_lifestyle
+
+for (nm in c("CAZy", "COG", "BGC", "Combined")) {
+  d  <- list(CAZy = cazy_d, COG = cog_d, BGC = bgc_d, Combined = combined_d)[[nm]]
+  mt <- list(CAZy = cazy_m, COG = cog_meta, BGC = bgc_meta, Combined = meta_cf)[[nm]]
+  cat("\n=== betadisper by lifestyle:", nm, "===\n")
+  print(anova(betadisper(d, mt$lifestyle)))
+}
+```
+
+## Mantel tests: phylogenetic vs functional distance
+
+```{r}
+#| label: mantel_test
+
+patristic <- cophenetic.phylo(tr)
+
+mantel_block <- function(func_d, block_name) {
+  common <- intersect(rownames(as.matrix(func_d)), rownames(patristic))
+  pd  <- as.dist(patristic[common, common])
+  fd  <- as.dist(as.matrix(func_d)[common, common])
+  cat(sprintf("\n=== Mantel test: patristic distance vs %s (n = %d) ===\n",
+              block_name, length(common)))
+  print(mantel(pd, fd, permutations = N_PERM))
+}
+
+mantel_block(cazy_d, "CAZy")
+mantel_block(cog_d,  "COG")
+mantel_block(bgc_d,  "BGC")
+mantel_block(eff_d,  "Effectors")
+mantel_block(combined_d,  "Combined")
+```
+
+# Figures
+
+## Ordination helper
+
+```{r}
+#| label: ordination_helper
+
+# PCA of a Hellinger-transformed block. Saves the plot and loadings and reports
+# the correlation of PC1 with total block content.
+ordinate_block <- function(mat_raw, block_label, file_stem, feature_col) {
+
+  mat_raw <- mat_raw[, colSums(mat_raw, na.rm = TRUE) > 0, drop = FALSE]
+  mat_raw[is.na(mat_raw)] <- 0
+
+  # Genomes with no content in the block would give NaN after Hellinger.
+  empty <- rownames(mat_raw)[rowSums(mat_raw) == 0]
+  if (length(empty)) {
+    warning(block_label, ": dropping ", length(empty),
+            " genome(s) with zero content in this block: ",
+            paste(empty, collapse = ", "))
+    mat_raw <- mat_raw[rowSums(mat_raw) > 0, , drop = FALSE]
+  }
+
+  hell <- decostand(mat_raw, method = "hellinger")
+  pca  <- prcomp(hell, center = TRUE, scale. = FALSE)
+  ve   <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+
+  scores <- as_tibble(pca$x[, 1:2], rownames = "sample") %>%
+    left_join(meta, by = "sample") %>%
+    mutate(role = case_when(
+             lifestyle == "Endophyte"  ~ "Endophyte (this study)",
+             lifestyle == "Pathogen"   ~ "Pathogen (reference)",
+             lifestyle == "Saprophyte" ~ "Saprophyte (reference)",
+             TRUE                      ~ "Yeast-like (reference)")) %>%
+    left_join(sci_name, by = "sample") %>%
+    mutate(lab_expr = if_else(lifestyle != "Endophyte", sci_expr, ""))
+
+  p <- ggplot(scores, aes(PC1, PC2)) +
+    geom_point(aes(color = class, shape = role), size = 4, alpha = 0.7) +
+    geom_text_repel(aes(label = lab_expr), parse = TRUE,
+                    point.padding = 1, box.padding = 0.5,
+                    size = 3, seed = 1, max.overlaps = 20,
+                    segment.colour = NA, show.legend = FALSE, na.rm = TRUE) +
+    scale_color_manual(values = class_palette, name = "Taxonomic\nclass") +
+    scale_shape_manual(
+      values = c("Endophyte (this study)" = 16, "Pathogen (reference)" = 17,
+                 "Saprophyte (reference)" = 15, "Yeast-like (reference)" = 18),
+      name = NULL) +
+    labs(title = block_label,
+          x = sprintf("PC1 (%.1f%%)", ve[1]),
+          y = sprintf("PC2 (%.1f%%)", ve[2])) +
+    guides(shape = guide_legend(ncol = 2))
+
+  save_plot(file.path("figures", file_stem), p, width = 12, height = 8)
+
+  loadings <- as_tibble(pca$rotation[, 1:2], rownames = feature_col) %>%
+    mutate(across(c(PC1, PC2), ~round(.x, 4))) %>%
+    arrange(desc(abs(PC1)))
+  write_csv(loadings, file.path("figures", paste0(file_stem, "_loadings.csv")))
+
+  r_total <- cor(pca$x[, 1], rowSums(mat_raw))
+
+  cat(sprintf("\n=== %s (%d genomes, %d features) ===\n",
+              block_label, nrow(mat_raw), ncol(mat_raw)))
+  cat(sprintf("  PC1 = %.1f%%  PC2 = %.1f%%  PC3 = %.1f%%  (PC1+PC2 = %.1f%%)\n",
+              ve[1], ve[2], ve[3], sum(ve[1:2])))
+  cat(sprintf("  PC1 vs total content in block: r = %+.3f\n", r_total))
+  cat("  top 5 features loading on PC1: ",
+      paste(head(loadings[[feature_col]], 5), collapse = ", "), "\n")
+
+  invisible(list(plot = p, scores = scores, loadings = loadings,
+                 ve = ve, r_total = r_total, pca = pca))
+}
+```
+
+## Fig 2 - CAZy Functional
+
+### CAZy families
+
+```{r}
+#| label: fig_cazy_ordination
+#| fig-width: 12
+#| fig-height: 8
+
+cazy_mat <- read_csv("files/matrix_cazy_family_per1000.csv", show_col_types = FALSE) %>%
+  column_to_rownames("sample")
+
+ord_cazy <- ordinate_block(cazy_mat, "CAZy families",
+                           "cazy_functional_ordination", "cazy_family")
+ord_cazy$plot
+```
+
+### Secreted CAZy families
+
+```{r}
+#| label: fig_secreted_cazy_ordination
+#| fig-width: 12
+#| fig-height: 8
+
+ord_sec <- ordinate_block(sec_mat, "Secreted CAZy families",
+                          "secreted_cazy_ordination", "cazy_family")
+ord_sec$plot
+```
+
+### COG categories
+
+```{r}
+#| label: fig_cog_ordination
+#| fig-width: 12
+#| fig-height: 8
+
+cog_mat <- read_csv("files/cog_category_counts.csv", show_col_types = FALSE) %>%
+  select(sample, category, count_per_1000_genes) %>%
+  pivot_wider(names_from = category, values_from = count_per_1000_genes,
+              values_fill = 0) %>%
+  column_to_rownames("sample")
+
+ord_cog <- ordinate_block(cog_mat, "COG categories",
+                          "cog_functional_ordination", "cog_category")
+
+ord_cog$plot
+```
+
+### BGC classes
+
+```{r}
+#| label: fig_bgc_ordination
+#| fig-width: 12
+#| fig-height: 8
+
+bgc_mat <- read_csv("files/antismash_bgc_class_counts.csv", show_col_types = FALSE) %>%
+  select(sample, bgc_class, n_regions_per_1000) %>%
+  pivot_wider(names_from = bgc_class, values_from = n_regions_per_1000,
+              values_fill = 0) %>%
+  column_to_rownames("sample")
+
+ord_bgc <- ordinate_block(bgc_mat, "BGC classes",
+                          "bgc_functional_ordination", "bgc_class")
+
+ord_bgc$plot
+```
+
+## Fig 3 - Combined Functional
+
+```{r}
+#| label: fig_combined_ordination
+#| fig-width: 12
+#| fig-height: 8
+
+# PCA on the block-weighted matrix (`combined`, `block_id` from combined_stats).
+pca_c <- prcomp(combined, center = TRUE, scale. = FALSE)
+ve_c  <- 100 * pca_c$sdev^2 / sum(pca_c$sdev^2)
+cat(sprintf("Combined PCA: PC1 = %.1f%%  PC2 = %.1f%%  (PC1+PC2 = %.1f%%)\n",
+            ve_c[1], ve_c[2], sum(ve_c[1:2])))
+
+# Share of each block in the PC1/PC2 loadings, to check the weighting.
+loadings_c <- pca_c$rotation[, 1:2]
+block_contrib <- tibble(block = block_id, PC1 = loadings_c[, 1]^2, PC2 = loadings_c[, 2]^2) %>%
+  group_by(block) %>% summarise(PC1_share = sum(PC1), PC2_share = sum(PC2)) %>%
+  mutate(across(c(PC1_share, PC2_share), ~round(100 * .x / sum(.x), 1)))
+cat("\nblock contribution to PC1/PC2 (%, should be roughly balanced if weighting worked):\n")
+print(block_contrib)
+
+ord_c <- as_tibble(pca_c$x[, 1:2], rownames = "sample") %>%
+  left_join(meta, by = "sample") %>%
+  mutate(role = if_else(lifestyle == "Endophyte", "Endophyte (this study)",
+                        paste0(lifestyle, " (reference)"))) %>%
+          left_join(sci_name, by = "sample") %>%
+  mutate(lab_expr = if_else(lifestyle != "Endophyte", sci_expr, ""))
+
+combined_ordination_plot <-
+  ggplot(ord_c, aes(PC1, PC2)) +
+  geom_point(aes(color = class, shape = role), size = 4, alpha = 0.7) +
+  geom_text_repel(aes(label = lab_expr), parse = TRUE, point.padding = 1, box.padding = 0.5, 
+                  size = 3, seed = 1, max.overlaps = 20,
+                  show.legend = FALSE, na.rm = TRUE) +
+  scale_color_manual(values = class_palette, name = "Taxonomic\nclass") +
+  scale_shape_manual(
+    values = c("Endophyte (this study)" = 16, "Pathogen (reference)" = 17,
+               "Saprophyte (reference)" = 15, "Yeast-like (reference)" = 18),
+    name = NULL) +
+  labs(
+    x = sprintf("PC1 (%.1f%%)", ve_c[1]), y = sprintf("PC2 (%.1f%%)", ve_c[2])
+  ) + guides(shape = guide_legend(ncol = 2))
+
+save_plot("figures/combined_functional_ordination", combined_ordination_plot,
+          width = 12, height = 8)
+```
+
+## Fig 4 - CAZy Secreted
+
+```{r}
+#| label: fig_cazy_secreted
+#| fig-width: 20
+#| fig-height: 8
+
+# 'No signal peptide': never screened by the TM filter. 'Non-secreted': signal
+# peptide but failed the TM filter. Denominator is all CAZyme genes.
+
+sec_sum <- read_parsed("secreted_cazyme_summary.csv", retained_samples) %>%
+            left_join(sci_name, by = "sample") |> 
+            mutate(sample = if_else(!is.na(sci_expr), sci_plain, sample))
+
+sec_order <- sec_sum  %>% 
+              arrange(desc(secreted_cazy_per_1000_genes)) %>% 
+              pull(sample)
+
+sec_long <- sec_sum %>%
+  select(sample,
+         Secreted      = secreted_cazyme_genes,
+         `Non-secreted (SP, failed TM filter)` = nonsecreted_cazyme_genes,
+         `No signal peptide`    = not_assessed_cazyme_genes,
+         total_genes) %>%
+  pivot_longer(-c(sample, total_genes),
+               names_to = "status", values_to = "n_genes") %>%
+  mutate(per_1000 = n_genes / total_genes * 1000,
+         status   = factor(status, levels = c(
+           "Secreted",
+           "Non-secreted (SP, failed TM filter)",
+           "No signal peptide"))) %>%
+  mutate(sample = factor(sample, levels = order_present(sample, sec_order)))
+
+secreted_cazyme_plot <-
+  ggplot(sec_long, aes(x = sample, y = per_1000, fill = status)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(values = c(
+    "Secreted"                            = "darkorange3",
+    "Non-secreted (SP, failed TM filter)" = "grey45",
+    "No signal peptide"                   = "grey80")) +
+  labs(
+    x = NULL, y = "CAZyme genes per 1000", fill = NULL,
+    caption  = label_caption
+  ) +
+  theme(axis.text.x = element_text(
+    color = axis_label_colors(levels(sec_long$sample),
+                              reference_samples, sci_name = TRUE),
+    angle = 60, hjust = 1))
+
+save_plot("figures/secreted_cazymes", secreted_cazyme_plot,
+       width = 20, height = 8)
+```
+
+## Fig 5 - PCWDE
+
+```{r}
+#| label: fig_pcwde_matched
+#| fig-width: 12
+#| fig-height: 8
+
+# Uses `union_tot` from the pcwde_robustness chunk.
+
+short_names <- c(
+  "Cellulose-associated (PCWDE)" = "Cellulose",
+  "Hemicellulose / xylan-associated (PCWDE)" = "Hemicellulose",
+  "Mannan-associated (PCWDE)" = "Mannan",
+  "Pectin-associated (PCWDE)" = "Pectin",
+  "Cutin / suberin / cuticle esterase (infection-relevant)" = "Cutin",
+  "Oxidative polysaccharide cleavage / LPMO" = "LPMO",
+  "Auxiliary redox / lignin-related oxidation (mostly NOT lignin in Dothideomycetes)" = "AuxRedox",
+  "Starch / storage glucan-associated" = "Starch",
+  "Chitin / fungal cell wall - chitin (FCWE)" = "Chitin",
+  "Fungal cell wall - beta/alpha-glucan (FCWE, remodelling)" = "Glucan"
+)
+
+act_w <- read_parsed("cazy_activity_group_counts.csv", retained_samples) %>%
+  mutate(short = recode(activity_group, !!!short_names)) %>%
+  select(sample, short, n_genes_per_1000) %>%
+  pivot_wider(names_from = short, values_from = n_genes_per_1000, values_fill = 0) %>%
+  left_join(meta, by = "sample") %>%
+  # Total PCWDE counts each gene once.
+  left_join(union_tot %>% select(sample, PCWDE = total_inclusive), by = "sample")
+
+cat("Dothideomycete isolate PCWDE range:",
+    paste(round(range(act_w$PCWDE[act_w$class == "Dothideomycetes" &
+                                  act_w$lifestyle == "Endophyte"]), 1), collapse = " to "), "\n")
+
+traits_plot <- c("PCWDE", "Hemicellulose", "Cellulose", "Pectin", "Cutin")
+
+matched_long <- act_w %>%
+  filter(class == "Dothideomycetes") %>%
+  select(sample, lifestyle, all_of(traits_plot)) %>%
+  pivot_longer(all_of(traits_plot), names_to = "trait", values_to = "per_1000") %>%
+  mutate(
+    trait = factor(trait, levels = traits_plot),
+    grp   = case_when(
+      sample %in% c("Lacicola", "Dseptosporum") ~ "Needle specialist",
+      lifestyle == "Pathogen"                   ~ "Other pathogen",
+      TRUE                                      ~ "Endophyte (this study)")
+  )
+
+matched_long_pcwde <- matched_long |> filter(trait == "PCWDE")
+matched_long_ind <- matched_long |> filter(trait != "PCWDE")
+
+plot_pcwde <- function(matched_df){
+    ggplot(matched_df %>% filter(grp == "Endophyte (this study)"),
+    aes(x = trait, y = per_1000)) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, fill = "grey90", color = "grey45") +
+  geom_jitter(width = 0.12, size = 1.4, alpha = 0.45, color = "grey30") +
+  geom_point(
+    data = matched_df %>% filter(grp != "Endophyte (this study)"),
+    aes(color = sample, shape = grp, size = grp), stroke = 1,
+    position = position_dodge(width = 0.4)) +
+  scale_size_manual(values = c(4, 3),  name = NULL) +
+  scale_color_manual(
+    values = c(Lacicola = "#D6212B", Dseptosporum = "#F07818",
+               Dsapinea = "#3B7DD8", Ztritici = "#228B22"),
+               breaks = sci_name$sample, labels = sci_name$sci_md, name = NULL) +
+  scale_shape_manual(values = c("Needle specialist" = 18, "Other pathogen" = 17),
+                     name = NULL) +
+  labs(x = NULL, y = "Genes per 1,000 predicted genes") +
+  theme(legend.text = element_markdown(),
+        legend.position = "bottom")+
+  guides(size = guide_legend(ncol = 1), color = guide_legend(ncol = 2))
+}
+
+pcwde_matched_plot <- 
+  ggarrange(plot_pcwde(matched_long_pcwde),
+          plot_pcwde(matched_long_ind) + rremove("ylab"),
+          labels = c("A", "B"), widths = c(1,3),
+          common.legend = TRUE,
+          legend = "bottom")
+  
+
+save_plot("figures/pcwde_matched_dothideomycetes", pcwde_matched_plot, width = 12, height = 8)
+```
+
+## Fig 6 - BGC by Classes
+
+```{r}
+#| label: fig_bgc_by_class
+#| fig-width: 12
+#| fig-height: 8
+
+# Uses `bgc_tot` from the bgc_counts chunk.
+
+bgc_plot_df <- bgc_tot %>%
+  filter(class %in% c("Dothideomycetes", "Eurotiomycetes",
+                      "Sordariomycetes", "Leotiomycetes")) %>%
+  mutate(
+    class = factor(class, levels = c("Dothideomycetes", "Eurotiomycetes",
+                                     "Sordariomycetes", "Leotiomycetes")),
+    grp = if_else(lifestyle == "Endophyte", "Endophyte (this study)", "Reference")) |>
+  left_join(sci_name, by = "sample")
+
+bgc_class_plot <-
+ ggplot(
+    bgc_plot_df %>% filter(grp == "Endophyte (this study)"),
+    aes(x = class, y = n_bgc)) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, fill = "grey90", color = "grey45") +
+  geom_jitter(width = 0.12, size = 1.5, alpha = 0.45, color = "grey30") +
+  geom_point(data = bgc_plot_df %>% filter(grp == "Reference"),
+             aes(color = sample), size = 3.5, shape = 17) +
+  geom_label_repel(data = bgc_plot_df %>% filter(grp == "Reference"),
+                  nudge_x = 0.15, hjust = 0, 
+                  aes(label = sci_expr, color = sample), parse = TRUE,
+                  size = 4, show.legend = FALSE) +
+  scale_color_paletteer_d("MoMAColors::Klein", name = NULL, guide = "none") +
+  labs(
+    x = "Taxonomic class", y = "Biosynthetic gene clusters per genome",
+  )
+
+save_plot("figures/bgc_by_taxonomic_class", bgc_class_plot, width = 12, height = 8)
+```
+
+## Supplementary
+
+### QC: genome size, N50 and BUSCO completeness
+
+```{r}
+#| label: fig_qc_size_busco
+#| fig-width: 40
+#| fig-height: 15
+
+n50_scale <- max(qc_all$genome_size_mb, na.rm = TRUE) /
+             max(qc_all$n50_kb, na.rm = TRUE)
+
+genome_size_plot <- ggplot(qc_all, aes(x = reorder(sample, genome_size_mb))) +
+  geom_col(aes(y = genome_size_mb),fill = "steelblue", width = 0.7) +
+  geom_point(aes(y = n50_kb * n50_scale), color = "firebrick", size = 2.5) +
+  scale_y_continuous(
+    name     = "Genome size (Mb)",
+    expand   = expansion(mult = c(0, 0.05)),
+    sec.axis = sec_axis(~ . / n50_scale, name = "Contig N50 (kb)")
+  ) +
+  labs(
+    x       = NULL,
+    caption = "Bars: genome size (left axis). Red points: contig N50 (right axis)."
+  ) +
+  theme(
+    axis.text.x        = element_text(angle = 45, vjust = 1, hjust = 1),
+    axis.title.y.right = element_text(color = "firebrick"),
+    axis.text.y.right  = element_text(color = "firebrick"),
+    panel.grid.major.x = element_blank()
+  ) 
+
+# BUSCO completeness
+
+busco_long <- qc_all %>%
+  select(sample,
+         single_copy = sc_percent,
+         duplicated  = mc_percent,
+         fragmented  = f_percent,
+         missing     = m_percent) %>%
+  pivot_longer(-sample, names_to = "category", values_to = "percent")
+
+busco_sample_order <- qc_all %>% arrange(desc(m_percent)) %>% pull(sample)
+busco_long <- busco_long %>%
+  mutate(
+    sample   = factor(sample, levels = busco_sample_order),
+    category = factor(category,
+                      levels = c("single_copy", "duplicated", "fragmented", "missing"))
+  )
+
+busco_colors <- c("single_copy" = "dodgerblue4", "duplicated" = "steelblue",
+                  "fragmented"  = "goldenrod",   "missing"    = "lightcoral")
+
+# Mark the genomes the duplication threshold removes.
+busco_excluded <- qc_all %>% filter(!passes_qc) %>% pull(sample)
+
+busco_plot <- ggplot(busco_long, aes(x = sample, y = percent, fill = category)) +
+  geom_col(position = position_stack(reverse = TRUE), width = 0.8) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(
+    name   = NULL,
+    values = busco_colors,
+    labels = c("Single copy", "Duplicated", "Fragmented", "Missing")
+  ) +
+  labs(
+    x = NULL, y = "Percentage of BUSCO genes"
+  ) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(
+          angle = 45, vjust = 1, hjust = 1,
+          face  = if_else(levels(busco_long$sample) %in% busco_excluded,
+                          "bold.italic", "plain"),
+          color = if_else(levels(busco_long$sample) %in% busco_excluded,
+                          "firebrick", "grey20")))
+
+size_busco_plot <- ggarrange(genome_size_plot, busco_plot, ncol = 1, nrow = 2,
+                             labels = c("A", "B"))
+save_plot("figures/size_busco_plot", size_busco_plot, width = 40, height = 15)
+```
+
+### CAZy classes (heatmap)
+
+```{r}
+#| label: fig_cazy_class
+#| fig-width: 20
+#| fig-height: 8
+
+classes_names <- c("GH"  = "Glycoside Hydrolases",
+                   "GT"  = "GlycosylTransferases",
+                   "PL"  = "Polysaccharide Lyases",
+                   "CE"  = "Carbohydrate Esterases",
+                   "AA"  = "Auxiliary Activities",
+                   "CBM" = "Carbohydrate-Binding Modules")
+
+cazy_class_raw <- read_parsed("cazy_class_counts.csv", retained_samples)
+
+cazy_class_matrix <- cazy_class_raw %>%
+  select(sample, cazy_class, count_per_1000_genes) %>%
+  mutate(cazy_class = recode(cazy_class, !!!classes_names)) %>%
+  pivot_wider(names_from = cazy_class, values_from = count_per_1000_genes,
+              values_fill = 0) %>%
+  column_to_rownames("sample") %>%
+  as.matrix() %>% t()
+
+draw_heatmap(cazy_class_matrix, "cazy_class_plot")
+```
+
+### CAZy activity groups (heatmap)
+
+```{r}
+#| label: fig_cazy_activity_heatmap
+#| fig-width: 20
+#| fig-height: 8
+
+activity_meta <- tribble(
+  ~activity_group,                                                                      ~short,                  ~compartment,
+  "Cellulose-associated (PCWDE)",                                                       "Cellulose",             "Plant cell wall",
+  "Hemicellulose / xylan-associated (PCWDE)",                                           "Hemicellulose / xylan", "Plant cell wall",
+  "Mannan-associated (PCWDE)",                                                          "Mannan",                "Plant cell wall",
+  "Pectin-associated (PCWDE)",                                                          "Pectin",                "Plant cell wall",
+  "Cutin / suberin / cuticle esterase (infection-relevant)",                            "Cutin / cuticle",       "Cuticle\n(infection)",
+  "Oxidative polysaccharide cleavage / LPMO",                                           "LPMO",                  "Oxidative",
+  "Auxiliary redox / lignin-related oxidation (mostly NOT lignin in Dothideomycetes)",  "Auxiliary redox",       "Oxidative",
+  "Starch / storage glucan-associated",                                                 "Starch / storage",      "Storage",
+  "Chitin / fungal cell wall - chitin (FCWE)",                                          "Chitin",                "Fungal\ncell wall",
+  "Fungal cell wall - beta/alpha-glucan (FCWE, remodelling)",                           "beta/alpha-glucan",     "Fungal\ncell wall",
+  "Other / ungrouped CAZy",                                                             "Ungrouped",             "Other"
+)
+compartment_levels <- c("Plant cell wall", "Cuticle\n(infection)",
+                        "Fungal\ncell wall", "Oxidative", "Storage", "Other")
+
+act_df <- read_parsed("cazy_activity_group_counts.csv", retained_samples) %>%
+  left_join(activity_meta, by = "activity_group") %>%
+  mutate(short       = coalesce(short, activity_group),
+         compartment = coalesce(compartment, "Other"))
+
+act_matrix <- act_df %>%
+  distinct(sample, short, n_genes_per_1000) %>%
+  pivot_wider(names_from = sample, values_from = n_genes_per_1000,
+              values_fill = 0) %>%
+  column_to_rownames("short") %>%
+  as.matrix()
+
+row_meta <- act_df %>%
+  distinct(short, compartment) %>%
+  mutate(compartment = factor(compartment, levels = compartment_levels)) %>%
+  arrange(compartment, short) %>%
+  mutate(compartment = fct_drop(compartment))
+
+act_matrix <- act_matrix[row_meta$short, , drop = FALSE]
+act_matrix <- act_matrix[, order_present(colnames(act_matrix), sample_order),
+                         drop = FALSE]
+
+cazy_act_col <- cap_colors(act_matrix)
+
+cazy_activity_heatmap <- Heatmap(
+  act_matrix,
+  name = "activity",
+  col  = cazy_act_col$fun,
+  cluster_rows        = FALSE,
+  row_split           = row_meta$compartment,
+  cluster_row_slices  = FALSE,
+  row_title_rot       = 0,
+  row_title_gp        = gpar(fontface = "bold"),
+  row_gap             = unit(2, "mm"),
+  row_names_side      = "left",
+  row_names_max_width = unit(20, "cm"),
+  cluster_columns     = TRUE,
+  show_column_names   = FALSE,
+  column_dend_height  = unit(3, "cm"),
+  top_annotation      = make_top_anno(act_matrix, tax_info),
+  border              = TRUE,
+  heatmap_legend_param = list(
+    title = "Genes per\n1000", title_position = "topcenter",
+    direction = "horizontal", legend_width = unit(3, "cm"),
+    at = cazy_act_col$at, labels = cazy_act_col$labels)
+)
+
+png("figures/cazy_activity_heatmap.png", width = 16, height = 9,
+    units = "in", res = 300)
+draw(cazy_activity_heatmap, heatmap_legend_side = "right",
+     annotation_legend_side = "right", merge_legends = TRUE)
+dev.off()
+```
+
+### Plant cell wall CAZymes (heatmap)
+
+```{r}
+#| label: fig_cazy_plantcellwall
+#| fig-width: 20
+#| fig-height: 8
+
+focus_compartment <- "Plant cell wall"
+
+act_one <- act_df %>% filter(compartment == focus_compartment)
+
+m1 <- act_one %>%
+  distinct(sample, short, n_genes_per_1000) %>%
+  pivot_wider(names_from = sample, values_from = n_genes_per_1000,
+              values_fill = 0) %>%
+  column_to_rownames("short") %>% as.matrix()
+
+m1 <- m1[act_one %>% distinct(short) %>% arrange(short) %>% pull(short),
+         order_present(colnames(m1), sample_order), drop = FALSE]
+
+col1 <- cap_colors(m1)
+h1 <- Heatmap(
+  m1, name = "activity", col = col1$fun,
+  cluster_rows = FALSE, cluster_columns = TRUE,
+  show_column_names = FALSE, column_dend_height = unit(3, "cm"),
+  row_names_side = "left", row_names_max_width = unit(20, "cm"),
+  column_title = paste(focus_compartment, "CAZymes"),
+  top_annotation = make_top_anno(m1, tax_info), border = TRUE,
+  heatmap_legend_param = list(
+    title = "Genes per\n1000", title_position = "topcenter",
+    direction = "horizontal", legend_width = unit(3, "cm"),
+    at = col1$at, labels = col1$labels)
+)
+
+png("figures/cazy_plantcellwall_activity.png", width = 14, height = 5,
+    units = "in", res = 300)
+draw(h1, heatmap_legend_side = "right", annotation_legend_side = "right",
+     merge_legends = TRUE)
+dev.off()
+```
+
+### PCWDE vs FCWE
+
+```{r}
+#| label: fig_pcwde_vs_fcwe
+#| fig-width: 20
+#| fig-height: 8
+
+totals <- read_parsed("product_summary.csv", retained_samples) %>%
+  select(sample, total_genes = total_mrna_features)
+
+plant_groups <- c("Cellulose-associated (PCWDE)",
+                  "Hemicellulose / xylan-associated (PCWDE)",
+                  "Mannan-associated (PCWDE)",
+                  "Pectin-associated (PCWDE)")
+fungal_groups <- c("Chitin / fungal cell wall - chitin (FCWE)",
+                   "Fungal cell wall - beta/alpha-glucan (FCWE, remodelling)")
+
+comp_long <- read_parsed("cazy_activity_gene_long.csv", retained_samples) %>%
+  mutate(compartment = case_when(
+    activity_group %in% plant_groups  ~ "Plant cell wall (PCWDE)",
+    activity_group %in% fungal_groups ~ "Fungal cell wall (FCWE)",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(compartment)) %>%
+  distinct(sample, transcript_id, compartment) %>%
+  count(sample, compartment, name = "n_genes") %>%
+  left_join(totals, by = "sample") %>%
+  mutate(per_1000 = n_genes / total_genes * 1000) %>%
+  complete(sample, compartment, fill = list(per_1000 = 0)) %>%
+  mutate(compartment = factor(compartment,
+                              levels = c("Plant cell wall (PCWDE)",
+                                         "Fungal cell wall (FCWE)")))
+
+comp_order <- comp_long %>%
+  filter(compartment == "Plant cell wall (PCWDE)") %>%
+  arrange(desc(per_1000)) %>% pull(sample)
+
+comp_long <- comp_long %>%
+  mutate(sample = factor(sample, levels = order_present(sample, comp_order)))
+
+pcwde_fcwe_plot <- ggplot(comp_long,
+                          aes(x = sample, y = per_1000, fill = compartment)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  scale_fill_manual(values = c("Plant cell wall (PCWDE)" = "darkorange3",
+                               "Fungal cell wall (FCWE)" = "steelblue4")) +
+  labs(
+    x = NULL, y = "Genes per 1000", fill = NULL,
+    title    = "Plant-biomass vs fungal-cell-wall CAZyme investment",
+    subtitle = "Plant-cell-wall-degrading (PCWDE) vs fungal-cell-wall (FCWE) genes per genome",
+    caption  = label_caption
+  ) +
+  theme(axis.text.x = element_text(
+    color = axis_label_colors(levels(comp_long$sample), reference_samples),
+    angle = 45, hjust = 1))
+```
+
+### Pectin-active CAZymes
+
+```{r}
+#| label: fig_pectin
+#| fig-width: 20
+#| fig-height: 8
+
+act <- act_df %>%
+  complete(sample, nesting(short, compartment),
+           fill = list(n_genes_per_1000 = 0)) %>%
+  mutate(
+    sample      = factor(sample, levels = order_present(sample, sample_order)),
+    compartment = factor(compartment, levels = compartment_levels)
+  ) %>%
+  filter(!is.na(sample)) %>%
+  mutate(compartment = fct_drop(compartment))
+
+pectin_df <- act %>% filter(short == "Pectin")
+
+pectin_plot <- ggplot(pectin_df, aes(x = sample, y = n_genes_per_1000)) +
+  geom_col(fill = "darkorange3", width = 0.75) +
+  labs(
+    x = NULL, y = "Pectin-active genes per 1000",
+    title    = "Pectinolytic CAZymes are reduced in pine needle-associated fungi",
+    subtitle = "Pectin-targeting families (GH28, pectin and rhamnogalacturonan lyases, etc.)",
+    caption  = label_caption
+  ) +
+  theme(axis.text.x = element_text(
+    color = axis_label_colors(levels(pectin_df$sample), reference_samples),
+    angle = 45, hjust = 1))
+```
+
+### Effector class composition (ternary)
+
+```{r}
+#| label: fig_effector_ternary
+#| fig-width: 9
+#| fig-height: 8
+
+# Three-part composition summing to 1 per genome, so a ternary plot rather than a PCA.
+
+eff_tern <- read_csv("files/effectorp_class_counts.csv", show_col_types = FALSE) %>%
+  filter(effector_class != "Non-effector") %>%
+  select(sample, effector_class, n_genes) %>%
+  pivot_wider(names_from = effector_class, values_from = n_genes, values_fill = 0)
+
+# Genomes with no predicted effectors have no composition; report and drop them.
+n_eff_total <- rowSums(eff_tern[, c("Apoplastic", "Cytoplasmic", "Dual")])
+if (any(n_eff_total == 0)) {
+  cat(sprintf("dropped %d genome(s) with zero predicted effectors: %s\n",
+              sum(n_eff_total == 0),
+              paste(eff_tern$sample[n_eff_total == 0], collapse = ", ")))
+}
+
+eff_tern <- eff_tern %>%
+  filter(n_eff_total > 0) %>%
+  mutate(n_effectors = Apoplastic + Cytoplasmic + Dual) %>%
+  left_join(meta, by = "sample") %>%
+  left_join(sci_name, by = "sample") %>%
+  mutate(
+    role = case_when(
+      lifestyle == "Endophyte"  ~ "Endophyte (this study)",
+      lifestyle == "Pathogen"   ~ "Pathogen (reference)",
+      lifestyle == "Saprophyte" ~ "Saprophyte (reference)",
+      TRUE                      ~ "Yeast-like (reference)"),
+    lab_expr = if_else(lifestyle != "Endophyte", sci_expr, ""))
+
+cat(sprintf("\nternary plot: %d genomes\n", nrow(eff_tern)))
+cat("mean proportions by lifestyle:\n")
+print(eff_tern %>%
+        mutate(across(c(Apoplastic, Cytoplasmic, Dual), ~ .x / n_effectors)) %>%
+        group_by(lifestyle) %>%
+        summarise(n = n(),
+                  across(c(Apoplastic, Cytoplasmic, Dual),
+                         ~ round(mean(.x), 3)), .groups = "drop"))
+
+# ggtern normalises the three axes internally, so raw counts can be passed.
+# effector_ternary_plot <-
+#   ggtern::ggtern(eff_tern, aes(x = Apoplastic, y = Cytoplasmic, z = Dual)) +
+#   geom_point(aes(color = class, shape = role, size = n_effectors), alpha = 0.7) +
+#   geom_text(aes(label = lab_expr), parse = TRUE, size = 2.6,
+#             vjust = -1.1, show.legend = FALSE, na.rm = TRUE) +
+#   scale_color_manual(values = class_palette, name = "Taxonomic\nclass") +
+#   scale_shape_manual(
+#     values = c("Endophyte (this study)" = 16, "Pathogen (reference)" = 17,
+#                "Saprophyte (reference)" = 15, "Yeast-like (reference)" = 18),
+#     name = NULL) +
+#   scale_size_continuous(range = c(1.5, 5), name = "Effectors\nper genome") +
+#   labs(
+#     T = "Cytoplasmic", L = "Apoplastic", R = "Dual",
+#     title = "Effector class composition does not separate lifestyles",
+#     subtitle = "Each point is one genome; position gives the relative balance of the three predicted classes"
+#   ) +
+#   theme_bw() +
+#   theme(legend.position = "right") +
+#   guides(shape = guide_legend(order = 2), color = guide_legend(order = 1))
+# 
+# # ggtern::ggsave("figures/effector_ternary.png", effector_ternary_plot,
+# #                width = 9, height = 8, dpi = 400, bg = "white")
+# 
+# effector_ternary_plot
+```
+
+### COG categories (heatmaps)
+
+```{r}
+#| label: fig_cog_heatmaps
+#| fig-width: 20
+#| fig-height: 8
+
+cog <- cog_raw %>%
+  filter(category_code != "S") %>%
+  complete(sample, nesting(category_code, category),
+           fill = list(count_per_1000_genes = 0)) %>%
+  mutate(sample = factor(sample, levels = order_present(sample, sample_order))) %>%
+  filter(!is.na(sample))
+
+cat_order <- cog %>%
+  group_by(category) %>%
+  summarise(m = mean(count_per_1000_genes), .groups = "drop") %>%
+  arrange(m) %>% pull(category)
+cog <- cog %>% mutate(category = factor(category, levels = cat_order))
+
+to_matrix <- function(df, value_col) {
+  df %>%
+    select(sample, category, all_of(value_col)) %>%
+    pivot_wider(names_from = category, values_from = all_of(value_col),
+                values_fill = 0) %>%
+    column_to_rownames("sample") %>%
+    as.matrix() %>%
+    t()                       # rows = category, cols = sample
+}
+
+cog_matrix <- to_matrix(cog, "count_per_1000_genes")
+
+keep_cog <- c("G", "Q", "T", "V", "O", "U", "I", "P")
+cog_filtered_matrix <- cog %>%
+  filter(category_code %in% keep_cog) %>%
+  to_matrix("count_per_1000_genes")
+
+draw_heatmap(cog_matrix,          "cog_plot")
+draw_heatmap(cog_filtered_matrix, "cog_plot_filtered")
+```
+
+### BGC classes (heatmap)
+
+```{r}
+#| label: fig_bgc_class_heatmap
+#| fig-width: 20
+#| fig-height: 8
+
+bgc_matrix <- bgc_raw %>%
+  select(sample, bgc_class, n_regions_per_1000) %>%
+  pivot_wider(names_from = bgc_class, values_from = n_regions_per_1000,
+              values_fill = 0) %>%
+  column_to_rownames("sample") %>%
+  as.matrix() %>% t()
+
+bgc_matrix <- bgc_matrix[
+  , order_present(colnames(bgc_matrix), sample_order), drop = FALSE
+]
+
+draw_heatmap(bgc_matrix, "bgc_bgc_class_plot",
+            title = "Secondary metabolite cluster classes per genome")
+```
+
+### BGC regions on contig edges
+
+```{r}
+#| label: fig_bgc_contig_edge
+#| fig-width: 20
+#| fig-height: 8
+
+bgc_regions <- read_parsed("antismash_regions_long.csv", retained_samples)
+
+edge_summary <- bgc_regions %>%
+  mutate(sample = factor(sample, levels = order_present(sample, sample_order))) %>%
+  filter(!is.na(sample)) %>%
+  count(sample, contig_edge) %>%
+  complete(sample, contig_edge, fill = list(n = 0))
+
+edge_plot <- ggplot(edge_summary,
+                    aes(x = sample, y = n, fill = contig_edge)) +
+  geom_col(position = "stack", width = 0.75) +
+  scale_fill_manual(
+    values = c(`FALSE` = "steelblue4", `TRUE` = "firebrick"),
+    labels = c(`FALSE` = "Complete", `TRUE` = "Truncated (contig edge)"),
+    name = NULL
+  ) +
+  labs(
+    x = NULL, y = "Number of BGC regions"
+  ) +
+  theme(axis.text.x = element_text(
+    color = axis_label_colors(levels(edge_summary$sample), reference_samples),
+    angle = 60, hjust = 1))
+
+save_plot("figures/bgc_contig_edge", edge_plot, width = 16, height = 6)
+```
